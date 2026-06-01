@@ -47,8 +47,8 @@ def test_fetch_text_returns_title_visible_text_and_forwards_mobile_user_agent(mo
     result = helper.fetch_text(
         "https://example.com",
         timeout=15000,
-        user_agent=helper.IPHONE_SAFARI_UA,
-        viewport=helper.IPHONE_VIEWPORT,
+        user_agent=helper.ANDROID_CHROME_MOBILE_UA,
+        viewport=helper.ANDROID_MOBILE_VIEWPORT,
         max_chars=10,
         locale="en-US",
     )
@@ -61,8 +61,8 @@ def test_fetch_text_returns_title_visible_text_and_forwards_mobile_user_agent(mo
     assert page.goto_calls == [("https://example.com", {"timeout": 15000, "wait_until": "domcontentloaded"})]
     assert launch_calls == [{
         "headless": True,
-        "user_agent": helper.IPHONE_SAFARI_UA,
-        "viewport": helper.IPHONE_VIEWPORT,
+        "user_agent": helper.ANDROID_CHROME_MOBILE_UA,
+        "viewport": helper.ANDROID_MOBILE_VIEWPORT,
         "locale": "en-US",
     }]
     assert context.closed is True
@@ -112,6 +112,64 @@ def test_fetch_text_detects_common_challenge_text(monkeypatch):
     assert result.ok is False
     assert result.error_kind == "challenge_detected"
     assert context.closed is True
+
+
+def test_fetch_text_detects_google_sorry_redirect(monkeypatch):
+    import helper
+
+    page = FakePage(
+        title="https://www.google.com/search?q=test",
+        text="About this page\nOur systems have detected unusual traffic from your computer network.",
+        url="https://www.google.com/sorry/index?continue=https://www.google.com/search?q=test",
+    )
+    context = FakeContext(page)
+    monkeypatch.setattr(helper, "launch_context", lambda **kwargs: context)
+
+    result = helper.fetch_text("https://www.google.com/search?q=test")
+
+    assert result.ok is False
+    assert result.error_kind == "challenge_detected"
+    assert result.final_url.startswith("https://www.google.com/sorry/")
+
+
+def test_fetch_text_detects_google_consent_gate(monkeypatch):
+    import helper
+
+    page = FakePage(
+        title="Before you continue to Google",
+        text="EN\nSign in\nBefore you continue to Google\nWe use cookies and data to",
+        url="https://consent.google.com/m?continue=https://news.google.com/search?q=test",
+    )
+    context = FakeContext(page)
+    monkeypatch.setattr(helper, "launch_context", lambda **kwargs: context)
+
+    result = helper.fetch_text("https://news.google.com/search?q=test")
+
+    assert result.ok is False
+    assert result.error_kind == "challenge_detected"
+    assert result.final_url.startswith("https://consent.google.com/")
+
+
+def test_fetch_text_does_not_treat_search_results_with_recaptcha_mentions_as_challenge(monkeypatch):
+    import helper
+
+    page = FakePage(
+        title="CloakBrowser at DuckDuckGo",
+        text=(
+            "DuckDuckGo\n\n"
+            "1. GitHub - CloakHQ/CloakBrowser\n"
+            "0.9 reCAPTCHA v3 score — human-level, server-verified.\n"
+            "2. CloakBrowser — Stealth Chromium for Browser Automation"
+        ),
+        url="https://lite.duckduckgo.com/lite/?q=CloakBrowser",
+    )
+    context = FakeContext(page)
+    monkeypatch.setattr(helper, "launch_context", lambda **kwargs: context)
+
+    result = helper.fetch_text("https://lite.duckduckgo.com/lite/?q=CloakBrowser")
+
+    assert result.ok is True
+    assert result.error_kind is None
 
 
 def test_readiness_check_reports_local_navigation_stage(monkeypatch):

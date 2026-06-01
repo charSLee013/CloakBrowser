@@ -702,6 +702,17 @@ browser = launch(args=[
 - [`basic-puppeteer.ts`](js/examples/basic-puppeteer.ts) — Puppeteer launch and load
 - [`stealth-test.ts`](js/examples/stealth-test.ts) — Run against 6 detection sites
 
+### Agent Text Retrieval
+
+If an Agent only needs one-shot page text rather than a full browser workflow, start with the repo-local thin harness:
+
+- `helper.fetch_text()` — open one URL, return title, visible text, final URL, and structured `error_kind`
+- [`SKILL.md`](SKILL.md) — category-first guidance for `search`, `news`, and `academic` discovery
+- [`examples/agent/`](examples/agent/) — mounted-script and heredoc examples for quick Agent use
+
+The current default mobile profile for these Agent examples is `Android Chrome mobile`. Keep `iPhone Safari` as an explicit opt-in for lighter pages, not as the default Google/mobile stealth route.
+For mainstream search engines such as Google, Bing, Yahoo, and DuckDuckGo, the default recommendation is to try a mobile or lightweight search surface first, then fall back to desktop only when the mobile route is clearly worse for that engine or task.
+
 ### Framework Integrations
 
 CloakBrowser works with any framework that uses Playwright or Chromium:

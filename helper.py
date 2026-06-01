@@ -24,10 +24,10 @@ ANDROID_MOBILE_VIEWPORT = {"width": 412, "height": 915}
 
 _CHALLENGE_MARKERS = (
     "checking if the site connection is secure",
+    "our systems have detected unusual traffic from your computer network",
+    "please verify you are a human",
     "verify you are human",
-    "are you a human",
     "cf-browser-verification",
-    "captcha",
     "checking your browser",
     "access denied",
 )
@@ -83,7 +83,7 @@ def fetch_text(
         if max_chars is not None:
             visible_text = visible_text[:max_chars]
 
-        if _looks_like_challenge(visible_text):
+        if _looks_like_challenge(title, final_url, visible_text):
             return FetchTextResult(
                 ok=False,
                 title=title,
@@ -185,9 +185,19 @@ def readiness_check(
     return ReadinessResult(ok=True, stage="ok")
 
 
-def _looks_like_challenge(text: str) -> bool:
-    lower = text.lower()
-    return any(marker in lower for marker in _CHALLENGE_MARKERS)
+def _looks_like_challenge(title: str, final_url: str, text: str) -> bool:
+    lower_title = title.lower()
+    lower_url = final_url.lower()
+    lower_text = text.lower()
+    lead = lower_text[:1200]
+
+    if "google.com/sorry/" in lower_url:
+        return True
+    if "consent.google.com/" in lower_url:
+        return True
+    if lower_title.startswith("before you continue") and "accept all" in lead and "reject all" in lead:
+        return True
+    return any(marker in lead for marker in _CHALLENGE_MARKERS)
 
 
 def _classify_exception(exc: Exception) -> str:
@@ -195,7 +205,7 @@ def _classify_exception(exc: Exception) -> str:
     message = str(exc).lower()
     if "timeout" in name or "timeout" in message or "timed out" in message:
         return "navigation_timeout"
-    if _looks_like_challenge(message):
+    if any(marker in message for marker in _CHALLENGE_MARKERS):
         return "challenge_detected"
     return "unknown_error"
 
