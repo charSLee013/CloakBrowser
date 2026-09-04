@@ -11,7 +11,7 @@
 
 Drop-in Playwright/Puppeteer replacement. Same API, same code — just swap the import. **3 lines of code, 30 seconds to unblock.**
 
-- **48 source-level C++ patches** — canvas, WebGL, audio, fonts, GPU, screen, WebRTC, network timing, automation signals
+- **71 source-level C++ patches** — canvas, WebGL, audio, fonts, GPU, screen, WebRTC, network timing, automation signals
 - **0.9 reCAPTCHA v3 score** — human-level, server-verified
 - **Passes Cloudflare Turnstile**, FingerprintJS, BrowserScan — tested against 30+ detection sites
 - **`npm install cloakbrowser`** — binary auto-downloads, auto-updates, zero config
@@ -39,10 +39,23 @@ import { launch } from 'cloakbrowser';
 
 const browser = await launch();
 const page = await browser.newPage();
-await page.goto('https://protected-site.com');
+await page.goto('https://example.com');
 console.log(await page.title());
 await browser.close();
 ```
+
+**For sites with anti-bot protection**, add a residential proxy and these flags:
+
+```javascript
+const browser = await launch({
+    proxy: 'http://user:pass@residential-proxy:port',
+    geoip: true,       // match timezone + locale to proxy IP
+    headless: false,    // some sites detect headless even with C++ patches
+    humanize: true,     // human-like mouse, keyboard, scroll
+});
+```
+
+See the [main README](https://github.com/CloakHQ/CloakBrowser#troubleshooting) for site-specific troubleshooting (FingerprintJS, Kasada, reCAPTCHA).
 
 ### Puppeteer
 
@@ -53,7 +66,7 @@ import { launch } from 'cloakbrowser/puppeteer';
 
 const browser = await launch();
 const page = await browser.newPage();
-await page.goto('https://protected-site.com');
+await page.goto('https://example.com');
 console.log(await page.title());
 await browser.close();
 ```
@@ -88,6 +101,15 @@ const browser = await launch({
 const browser = await launch({
   timezone: 'America/New_York',
   locale: 'en-US',
+});
+
+// Pin an exact Chromium version (Free or Pro)
+const browser = await launch({ browserVersion: '146.0.7680.177.5' });
+
+// Opt into the Pro Preview binary channel
+const browser = await launch({
+  licenseKey: 'cb_xxxxxxxx',
+  releaseChannel: 'preview',
 });
 
 // Auto-detect timezone/locale from proxy IP (requires: npm install mmdb-lib)
@@ -141,11 +163,15 @@ const browser = await launch({ proxy: 'http://proxy:8080', geoip: true, timezone
 Pre-download the binary or check installation status from the command line:
 
 ```bash
+npx cloakbrowser login        # Get a free key via GitHub, or save a paid key
+npx cloakbrowser logout        # Remove the saved key (revert to the free binary)
 npx cloakbrowser install      # Download binary with progress output
 npx cloakbrowser info         # Show version, path, platform
 npx cloakbrowser update       # Check for and download newer binary
 npx cloakbrowser clear-cache  # Remove cached binaries
 ```
+
+`login` with no argument prompts you to paste a license key or press Enter to get a free key via a GitHub sign-in; `login <key>` saves a key directly. Both validate the key, then store it at `~/.cloakbrowser/license.key` so every launch picks it up.
 
 ### Utilities
 
@@ -189,6 +215,20 @@ if (newVersion) console.log(`Updated to ${newVersion}`);
 | `CLOAKBROWSER_DOWNLOAD_URL` | `cloakbrowser.dev` | Custom download URL |
 | `CLOAKBROWSER_AUTO_UPDATE` | `true` | Set to `false` to disable background update checks |
 | `CLOAKBROWSER_SKIP_CHECKSUM` | `false` | Set to `true` to skip SHA-256 verification after download |
+| `CLOAKBROWSER_WIDEVINE_CDM` | — | Path to a sideloaded `WidevineCdm` directory (overrides auto-detection next to the binary) |
+| `CLOAKBROWSER_WIDEVINE` | `1` | Set to `0` to disable automatic Widevine hint-file seeding for persistent contexts |
+| `CLOAKBROWSER_VERSION` | — | Pin to an exact Chromium version for rollback (e.g. `146.0.7680.177.5`). Works with Free and Pro binaries |
+| `CLOAKBROWSER_RELEASE_CHANNEL` | `stable` | Set to `preview` to opt into the Pro Preview binary channel |
+
+### Widevine / DRM
+
+The binary supports Widevine, but the CDM is proprietary and can't be redistributed. Sideload it once by copying a `WidevineCdm/` directory from a real Chrome install next to the binary (full steps in [#96](https://github.com/CloakHQ/CloakBrowser/issues/96)):
+
+```bash
+cp -r /opt/google/chrome/WidevineCdm ~/.cloakbrowser/chromium-<version>/WidevineCdm
+```
+
+With the CDM in place, `launchPersistentContext()` enables Widevine on the **first** launch — the wrapper auto-seeds the CDM hint file into the profile. This plays DRM-protected video (Netflix, Spotify Web) and makes a persistent profile present as a regular Chrome install to detection services that probe for DRM/EME support. **Linux only.** A sideloaded CDM is the opt-in (no flag); set `CLOAKBROWSER_WIDEVINE_CDM` for a custom path or `CLOAKBROWSER_WIDEVINE=0` to disable. See the [main README](https://github.com/CloakHQ/CloakBrowser#widevine--drm) for details.
 
 ## Migrate From Playwright
 
@@ -204,13 +244,33 @@ const page = await browser.newPage();
 
 ## Platforms
 
-| Platform | Chromium | Patches | Status |
+| Platform | Free | Pro | Status |
 |---|---|---|---|
-| Linux x86_64 | 145 | 48 | ✅ Latest |
-| Linux arm64 (RPi, Graviton) | 145 | 48 | ✅ Latest |
-| macOS arm64 (Apple Silicon) | 145 | 26 | ✅ Latest |
-| macOS x86_64 (Intel) | 145 | 26 | ✅ Latest |
-| Windows x86_64 | 145 | 48 | ✅ Latest |
+| Linux x86_64 | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
+| Linux arm64 (RPi, Graviton) | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
+| macOS arm64 (Apple Silicon) | Chromium 145 (26 patches) | Chromium 150 (71 patches) | ✅ |
+| macOS x86_64 (Intel) | Chromium 145 (26 patches) | Chromium 150 (71 patches) | ✅ |
+| Windows x86_64 | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
+
+## CloakBrowser Pro
+
+The wrappers (Python, JS, .NET) are MIT, free forever. The latest binary is **free to try** — throw it at your hardest target today.
+
+Anti-bot systems change every week and an older binary quietly degrades. The latest build is the one that keeps passing. **Try it free, then upgrade when you're running for real.**
+
+- **Free, latest build (Chromium 150)** — the newest binary, the exact one that stays [green against live detection](#test-results). Free with a GitHub sign-in, one concurrent session. [Grab your key](https://cloakbrowser.dev/free) or run `cloakbrowser login`, then point it at the site that's been blocking you.
+- **Pro** — when it's part of production scraping, QA, monitoring, or automation: scale to **5, 20, 200, 2,000, or more concurrent sessions**, always first on the newest patches, with hands-on support. Linux, Windows, macOS. **[See plans and pricing →](https://cloakbrowser.dev)**
+- **v146** — the older build stays free on [GitHub Releases](https://github.com/CloakHQ/cloakbrowser/releases). A quick first look, but it ages fast as detection evolves.
+
+Get a key and activate it:
+
+```bash
+cloakbrowser login          # GitHub sign-in for a free key, or paste a paid key
+# ...or set it directly (env var, licenseKey option, or ~/.cloakbrowser/license.key):
+export CLOAKBROWSER_LICENSE_KEY=cb_xxxxxxxx
+```
+
+Try the latest free → **[cloakbrowser.dev/free](https://cloakbrowser.dev/free)**  ·  Scale up on Pro → **[cloakbrowser.dev](https://cloakbrowser.dev)**
 
 ## Requirements
 
@@ -254,28 +314,58 @@ await new Promise(r => setTimeout(r, 3000));
 ```
 
 Other tips for maximizing reCAPTCHA scores:
+
 - **Use Playwright, not Puppeteer** — Puppeteer sends more CDP protocol traffic that reCAPTCHA detects ([details](#puppeteer))
 - **Use residential proxies** — datacenter IPs are flagged by IP reputation, not browser fingerprint
 - **Spend 15+ seconds on the page** before triggering reCAPTCHA — short visits score lower
 - **Space out requests** — back-to-back `grecaptcha.execute()` calls from the same session get penalized. Wait 30+ seconds between pages with reCAPTCHA
 - **Use a fixed fingerprint seed** (`--fingerprint=12345`) for consistent device identity across sessions
 - **Use `page.type()` instead of `page.fill()`** for form filling — `fill()` sets values directly without keyboard events, which reCAPTCHA's behavioral analysis flags. `type()` with a delay simulates real keystrokes:
+
   ```javascript
   await page.type('#email', 'user@example.com', { delay: 50 });
   ```
+
 - **Minimize `page.evaluate()` calls** before the reCAPTCHA check fires — each one sends CDP traffic
 
+**Try a Preview binary**
+
+Stable is the default. Opt into Preview per launch:
+
+```javascript
+const browser = await launch({
+  licenseKey: 'cb_xxxxxxxx',
+  releaseChannel: 'preview',
+});
+```
+
+Or set `CLOAKBROWSER_RELEASE_CHANNEL=preview` for all launches and CLI commands. Preview selects the newest build available for this platform: a newer Preview when present, otherwise Stable. `npx cloakbrowser info` reports the resolved channel and exact version. An exact `browserVersion` pin overrides the channel.
+
 **New update broke something? Roll back to the previous version**
-When auto-update downloads a newer binary, the previous version stays in `~/.cloakbrowser/`. Point `CLOAKBROWSER_BINARY_PATH` to the older cached binary:
+
+Pin to an exact binary version (keep current wrapper, use older Chromium):
+
+```bash
+export CLOAKBROWSER_VERSION=146.0.7680.177.5   # env var for all launches
+```
+
+```javascript
+const browser = await launch({ browserVersion: '146.0.7680.177.5' });
+```
+
+The pin is never sticky — unpinned launches always use the latest available version.
+
+Or point directly to a cached older binary on disk:
+
 ```bash
 # Linux
-export CLOAKBROWSER_BINARY_PATH=~/.cloakbrowser/chromium-145.0.7632.159.2/chrome
+export CLOAKBROWSER_BINARY_PATH=~/.cloakbrowser/chromium-146.0.7680.177.4/chrome
 
 # macOS
 export CLOAKBROWSER_BINARY_PATH=~/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium
 
 # Windows
-set CLOAKBROWSER_BINARY_PATH=%USERPROFILE%\.cloakbrowser\chromium-145.0.7632.159.7\chrome.exe
+set CLOAKBROWSER_BINARY_PATH=%USERPROFILE%\.cloakbrowser\chromium-146.0.7680.177.4\chrome.exe
 ```
 
 ## Links
@@ -284,7 +374,7 @@ set CLOAKBROWSER_BINARY_PATH=%USERPROFILE%\.cloakbrowser\chromium-145.0.7632.159
 - 🐛 [Bug reports & feature requests](https://github.com/CloakHQ/CloakBrowser/issues)
 - 📦 [PyPI (Python package)](https://pypi.org/project/cloakbrowser/)
 - 📖 [Full documentation](https://github.com/CloakHQ/CloakBrowser#readme)
-- 📧 Contact: cloakhq@pm.me
+- 📧 Contact: <cloakhq@pm.me>
 
 ## License
 

@@ -4,10 +4,10 @@
  * Activated via humanize: true in launch() / launchContext().
  * Patches page methods to use Bezier mouse curves, realistic typing, and smooth scrolling.
  *
- * Stealth-aware (fixes #110):
- *   - isInputElement / isSelectorFocused use CDP Isolated Worlds instead of page.evaluate
+ * Stealth-aware (fixes #110, #512):
+ *   - Selector resolution, state, geometry, and revalidation use the CDP isolated world
  *   - Shift symbol typing uses CDP Input.dispatchKeyEvent for isTrusted=true events
- *   - Falls back to page.evaluate only when CDP session is unavailable
+ *   - Unsupported selectors and isolated-world failures raise typed errors
  *
  * Patches all interaction methods:
  * click, dblclick, hover, type, fill, check, uncheck, selectOption,
@@ -23,22 +23,35 @@
  */
 
 import type { Browser, BrowserContext, Page, Frame, CDPSession } from 'playwright-core';
-import { HumanConfig, HumanActionOptions, resolveConfig, mergeConfig, rand, randRange, sleep } from './config.js';
-import { RawMouse, RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
-import { humanType } from './keyboard.js';
-import { scrollToElement, humanScrollIntoView } from './scroll.js';
-import { patchPageElementHandles, patchFrameElementHandles, patchSingleElementHandle } from './elementhandle.js';
+import { type HumanConfig, type HumanActionOptions, mergeConfig, rand, randRange, sleep } from './config.js';
+import { type RawMouse, type RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
+import { humanType, pressWithDelay } from './keyboard.js';
+import { scrollToElement } from './scroll.js';
+import { patchPageElementHandles, patchFrameElementHandles } from './elementhandle.js';
 import {
-  ensureActionable, ensureStable, checkPointerEvents,
+  ensureActionable, ensureStable, checkPointerEvents, ElementNotAttachedError,
   CHECKS_CLICK, CHECKS_HOVER, CHECKS_INPUT, CHECKS_FOCUS, CHECKS_CHECK,
-  type CheckName,
 } from './actionability.js';
+import {
+  buildSnapshotJs, evalParsed, OK, NOT_FOUND, UNSUPPORTED,
+  StealthEvaluationError, StealthWorldUnavailableError,
+  UnsupportedHumanizeSelectorError, type SnapshotPayload,
+} from './stealthDom.js';
 
 export { HumanConfig, resolveConfig, mergeConfig } from './config.js';
 export { humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
 export { humanType } from './keyboard.js';
 export { scrollToElement, humanScrollIntoView } from './scroll.js';
 export { patchSingleElementHandle } from './elementhandle.js';
+export {
+  ActionabilityError, ElementNotAttachedError, ElementNotVisibleError,
+  ElementNotStableError, ElementNotEnabledError, ElementNotEditableError,
+  ElementNotReceivingEventsError, ElementTargetChangedError,
+} from './actionability.js';
+export {
+  StealthDomError, UnsupportedHumanizeSelectorError,
+  StealthWorldUnavailableError, StealthEvaluationError,
+} from './stealthDom.js';
 
 // --- Platform-aware select-all shortcut (macOS uses Meta, others use Control) ---
 const SELECT_ALL = process.platform === 'darwin' ? 'Meta+a' : 'Control+a';
@@ -154,74 +167,19 @@ class CursorState {
 
 
 // ============================================================================
-// Stealth DOM queries — isolated world with evaluate fallback
+// Canonical selector snapshot — isolated world only
 // ============================================================================
 
-/**
- * Check if selector matches an input/textarea/contenteditable element.
- * Uses CDP Isolated World when available — invisible to main world.
- */
-async function isInputElement(
+async function selectorSnapshot(
   stealth: StealthEval | null,
-  page: Page,
   selector: string,
-): Promise<boolean> {
-  if (stealth) {
-    try {
-      const escaped = JSON.stringify(selector);
-      const result = await stealth.evaluate(`
-        (() => {
-          const el = document.querySelector(${escaped});
-          if (!el) return false;
-          const tag = el.tagName.toLowerCase();
-          return tag === 'input' || tag === 'textarea'
-            || el.getAttribute('contenteditable') === 'true';
-        })()
-      `);
-      return !!result;
-    } catch {
-      // Fall through to page.evaluate
-    }
-  }
-
-  // Fallback: page.evaluate (detectable — should only happen if CDP fails)
-  return page.evaluate((sel: string) => {
-    const el = document.querySelector(sel);
-    if (!el) return false;
-    const tag = el.tagName.toLowerCase();
-    return tag === 'input' || tag === 'textarea'
-      || el.getAttribute('contenteditable') === 'true';
-  }, selector).catch(() => false);
-}
-
-/**
- * Check if the element matching selector is currently focused.
- * Uses CDP Isolated World when available — invisible to main world.
- */
-async function isSelectorFocused(
-  stealth: StealthEval | null,
-  page: Page,
-  selector: string,
-): Promise<boolean> {
-  if (stealth) {
-    try {
-      const escaped = JSON.stringify(selector);
-      const result = await stealth.evaluate(`
-        (() => {
-          const el = document.querySelector(${escaped});
-          return el === document.activeElement;
-        })()
-      `);
-      return !!result;
-    } catch {
-      // Fall through to page.evaluate
-    }
-  }
-
-  return page.evaluate((sel: string) => {
-    const el = document.querySelector(sel);
-    return el === document.activeElement;
-  }, selector).catch(() => false);
+): Promise<SnapshotPayload> {
+  if (!stealth) throw new StealthWorldUnavailableError();
+  const { status, data } = await evalParsed(stealth, buildSnapshotJs(selector));
+  if (status === OK && data) return data as SnapshotPayload;
+  if (status === NOT_FOUND) throw new ElementNotAttachedError(selector);
+  if (status === UNSUPPORTED) throw new UnsupportedHumanizeSelectorError(selector);
+  throw new StealthEvaluationError(selector);
 }
 
 
@@ -241,7 +199,9 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     fill: page.fill.bind(page),
     check: page.check.bind(page),
     uncheck: page.uncheck.bind(page),
-    selectOption: page.selectOption.bind(page),
+    // Bind to the main frame, not the page: page.selectOption re-dispatches to the
+    // patched main-frame method, so binding to the page would loop forever.
+    selectOption: page.mainFrame().selectOption.bind(page.mainFrame()),
     press: page.press.bind(page),
     goto: page.goto.bind(page),
     isChecked: page.isChecked.bind(page),
@@ -271,7 +231,9 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     if (!cdpSession) {
       try {
         cdpSession = await stealth.getCdpSession();
-      } catch {}
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to create humanize CDP session:', error);
+      }
     }
     return cdpSession;
   };
@@ -330,19 +292,28 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     const { box, cursorX, cursorY, didScroll } = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
     cursor.x = cursorX;
     cursor.y = cursorY;
-    const isInput = await isInputElement(stealth, page, selector);
+    const isInput = (await selectorSnapshot(stealth, selector)).isInput;
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, isInput, callCfg);
-    if (!force) {
-      await checkPointerEvents(page, selector, target.x, target.y, stealth, remainingMs());
-    }
     await humanMove(raw, cursor.x, cursor.y, target.x, target.y, callCfg);
     cursor.x = target.x;
     cursor.y = target.y;
+    if (!force) {
+      await checkPointerEvents(
+        page, selector, finalBox.targetId, finalBox.gen, target.x, target.y,
+        stealth, remainingMs(),
+      );
+    }
     await humanClick(raw, isInput, callCfg);
   };
 
@@ -362,19 +333,28 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     const { box, cursorX, cursorY, didScroll } = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
     cursor.x = cursorX;
     cursor.y = cursorY;
-    const isInput = await isInputElement(stealth, page, selector);
+    const isInput = (await selectorSnapshot(stealth, selector)).isInput;
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, isInput, callCfg);
-    if (!force) {
-      await checkPointerEvents(page, selector, target.x, target.y, stealth, remainingMs());
-    }
     await humanMove(raw, cursor.x, cursor.y, target.x, target.y, callCfg);
     cursor.x = target.x;
     cursor.y = target.y;
+    if (!force) {
+      await checkPointerEvents(
+        page, selector, finalBox.targetId, finalBox.gen, target.x, target.y,
+        stealth, remainingMs(),
+      );
+    }
     await raw.down({ clickCount: 2 });
     await sleep(rand(30, 60));
     await raw.up({ clickCount: 2 });
@@ -400,15 +380,24 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, false, callCfg);
-    if (!force) {
-      await checkPointerEvents(page, selector, target.x, target.y, stealth, remainingMs());
-    }
     await humanMove(raw, cursor.x, cursor.y, target.x, target.y, callCfg);
     cursor.x = target.x;
     cursor.y = target.y;
+    if (!force) {
+      await checkPointerEvents(
+        page, selector, finalBox.targetId, finalBox.gen, target.x, target.y,
+        stealth, remainingMs(),
+      );
+    }
   };
 
   // --- type ---
@@ -455,7 +444,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     const remainingMs = () => Math.max(0, deadline - Date.now());
 
     if (!force) await ensureActionable(page, selector, CHECKS_FOCUS, remainingMs(), force);
-    if (!await isSelectorFocused(stealth, page, selector)) {
+    if (!(await selectorSnapshot(stealth, selector)).focused) {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
     await sleep(rand(50, 150));
@@ -476,7 +465,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     if (callCfg.idle_between_actions) {
       await humanIdle(raw, cursor.x, cursor.y, callCfg);
     }
-    const checked = await originals.isChecked(selector).catch(() => false);
+    const checked = (await selectorSnapshot(stealth, selector)).checked === true;
     if (!checked) {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
@@ -494,7 +483,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     if (callCfg.idle_between_actions) {
       await humanIdle(raw, cursor.x, cursor.y, callCfg);
     }
-    const checked = await originals.isChecked(selector).catch(() => true);
+    const checked = (await selectorSnapshot(stealth, selector)).checked === true;
     if (checked) {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
@@ -521,11 +510,11 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     const remainingMs = () => Math.max(0, deadline - Date.now());
 
     if (!force) await ensureActionable(page, selector, CHECKS_FOCUS, remainingMs(), force);
-    if (!await isSelectorFocused(stealth, page, selector)) {
+    if (!(await selectorSnapshot(stealth, selector)).focused) {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
     await sleep(rand(50, 150));
-    await originals.keyboardPress(key);
+    await pressWithDelay(originals.keyboardPress, key, options);
   };
 
   // --- pressSequentially ---
@@ -537,7 +526,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     const remainingMs = () => Math.max(0, deadline - Date.now());
 
     if (!force) await ensureActionable(page, selector, CHECKS_FOCUS, remainingMs(), force);
-    if (!await isSelectorFocused(stealth, page, selector)) {
+    if (!(await selectorSnapshot(stealth, selector)).focused) {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
     await sleep(rand(100, 250));
@@ -566,7 +555,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   (page as any).clear = humanClearFn;
 
   // --- mouse patches ---
-  page.mouse.move = async (x: number, y: number, options?: {
+  page.mouse.move = async (x: number, y: number, _options?: {
     steps?: number;
   }) => {
     await ensureCursorInit();
@@ -575,7 +564,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     cursor.y = y;
   };
 
-  page.mouse.click = async (x: number, y: number, options?: {
+  page.mouse.click = async (x: number, y: number, _options?: {
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
     delay?: number;
@@ -588,7 +577,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   };
 
   // --- keyboard patches ---
-  page.keyboard.type = async (text: string, options?: { delay?: number }) => {
+  page.keyboard.type = async (text: string, _options?: { delay?: number }) => {
     const cdp = await ensureCdp();
     await humanType(page, rawKb, text, cfg, cdp);
   };
@@ -639,10 +628,32 @@ function patchFrames(
   originals: any,
   stealth: StealthEval,
 ): void {
-  for (const frame of iterFrames(page)) {
+  const patchFrame = (frame: Frame): void => {
+    if ((frame as any)._humanPatched) return;
     patchSingleFrame(frame, page, cfg, cursor, raw, rawKb, originals, stealth);
-    // Patch frame-level ElementHandle selectors ($, $$, waitForSelector)
     patchFrameElementHandles(frame, page, cfg, cursor, raw, rawKb, originals, stealth);
+    (frame as any)._humanPatched = true;
+  };
+
+  if (!(page as any)._humanFrameListenerAttached) {
+    page.on('frameattached', (frame: Frame) => {
+      try {
+        patchFrame(frame);
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to humanize dynamically attached frame:', error);
+        throw error;
+      }
+    });
+    // Invalidate the isolated world on any main-frame nav, not just goto, so
+    // click/form navigations don't leave it bound to a stale doc (#507).
+    page.on('framenavigated', (frame: Frame) => {
+      if (frame === page.mainFrame()) stealth.invalidate();
+    });
+    (page as any)._humanFrameListenerAttached = true;
+  }
+
+  for (const frame of iterFrames(page)) {
+    patchFrame(frame);
   }
 }
 
@@ -674,8 +685,29 @@ function patchSingleFrame(
   originals: any,
   stealth: StealthEval,
 ): void {
-  if ((frame as any)._humanPatched) return;
-  (frame as any)._humanPatched = true;
+  // The main frame's Locator actions (page.locator(sel).click() etc.) delegate,
+  // in Playwright, to the main frame's own method. Route those to the already-
+  // patched page-level methods so they use the full humanized path with the
+  // isolated-world pre-click reads. Only true sub-frames use the frame-scoped
+  // path below (iterFrames() includes the main frame). Mirrors the Python
+  // wrapper, which intercepts at Locator.click and routes to page.click.
+  if (frame === page.mainFrame()) {
+    const p = page as any;
+    (frame as any).click = (selector: string, options?: HumanActionOptions) => p.click(selector, options);
+    (frame as any).dblclick = (selector: string, options?: HumanActionOptions) => p.dblclick(selector, options);
+    (frame as any).hover = (selector: string, options?: HumanActionOptions) => p.hover(selector, options);
+    (frame as any).type = (selector: string, text: string, options?: HumanActionOptions) => p.type(selector, text, options);
+    (frame as any).fill = (selector: string, value: string, options?: HumanActionOptions) => p.fill(selector, value, options);
+    (frame as any).check = (selector: string, options?: HumanActionOptions) => p.check(selector, options);
+    (frame as any).uncheck = (selector: string, options?: HumanActionOptions) => p.uncheck(selector, options);
+    (frame as any).selectOption = (selector: string, values: any, options?: HumanActionOptions) => p.selectOption(selector, values, options);
+    (frame as any).press = (selector: string, key: string, options?: HumanActionOptions) => p.press(selector, key, options);
+    (frame as any).pressSequentially = (selector: string, text: string, options?: HumanActionOptions) => p.pressSequentially(selector, text, options);
+    (frame as any).tap = (selector: string, options?: HumanActionOptions) => p.tap(selector, options);
+    (frame as any).clear = (selector: string, options?: HumanActionOptions) => p.clear(selector, options);
+    // dragAndDrop has no humanized page equivalent; left on the native path (still detectable, out of scope).
+    return;
+  }
 
   // Save originals for methods that need fallback
   const origFrameClick = frame.click.bind(frame);
@@ -686,12 +718,16 @@ function patchSingleFrame(
   const origFrameCheck = frame.check.bind(frame);
   const origFrameUncheck = frame.uncheck.bind(frame);
   const origFrameSelectOption = frame.selectOption.bind(frame);
-  const origFramePress = frame.press.bind(frame);
   const origFramePressSequentially = (frame as any).pressSequentially?.bind(frame);
   const origFrameTap = (frame as any).tap?.bind(frame);
   const origFrameDragAndDrop = frame.dragAndDrop.bind(frame);
 
-  const moveToFrameSelector = async (selector: string, options?: HumanActionOptions, inputBias = false) => {
+  const moveToFrameSelector = async (
+    selector: string,
+    options: HumanActionOptions | undefined,
+    inputBias: boolean,
+    remainingMs: () => number,
+  ) => {
     const callCfg = mergeConfig(cfg, options?.human_config ?? options);
     if (callCfg.idle_between_actions) {
       await humanIdle(raw, cursor.x, cursor.y, callCfg);
@@ -699,9 +735,9 @@ function patchSingleFrame(
 
     const locator = firstFrameLocator(frame, selector);
     if (typeof locator.scrollIntoViewIfNeeded === 'function') {
-      await locator.scrollIntoViewIfNeeded({ timeout: options?.timeout }).catch(() => undefined);
+      await locator.scrollIntoViewIfNeeded({ timeout: Math.max(1, remainingMs()) }).catch(() => undefined);
     }
-    const box = await locator.boundingBox({ timeout: options?.timeout ?? 30000 }).catch(() => null);
+    const box = await locator.boundingBox({ timeout: Math.max(1, remainingMs()) }).catch(() => null);
     if (!box) return null;
 
     const isInput = inputBias || await isFrameInputElement(frame, selector);
@@ -713,23 +749,32 @@ function patchSingleFrame(
   };
 
   const frameClick = async (selector: string, options?: HumanActionOptions) => {
-    const moved = await moveToFrameSelector(selector, options);
-    if (!moved) return origFrameClick(selector, options);
+    const timeout = options?.timeout ?? 30000;
+    const deadline = Date.now() + timeout;
+    const remainingMs = () => Math.max(0, deadline - Date.now());
+    const moved = await moveToFrameSelector(selector, options, false, remainingMs);
+    if (!moved) return origFrameClick(selector, { ...options, timeout: Math.max(1, remainingMs()) });
     await humanClick(raw, moved.isInput, moved.callCfg);
   };
 
   const getFrameCdp = async () => stealth.getCdpSession().catch(() => null);
 
   const frameHover = async (selector: string, options?: HumanActionOptions) => {
-    const moved = await moveToFrameSelector(selector, options, false);
-    if (!moved) return origFrameHover(selector, options);
+    const timeout = options?.timeout ?? 30000;
+    const deadline = Date.now() + timeout;
+    const remainingMs = () => Math.max(0, deadline - Date.now());
+    const moved = await moveToFrameSelector(selector, options, false, remainingMs);
+    if (!moved) return origFrameHover(selector, { ...options, timeout: Math.max(1, remainingMs()) });
   };
 
   (frame as any).click = frameClick;
 
   (frame as any).dblclick = async (selector: string, options?: HumanActionOptions) => {
-    const moved = await moveToFrameSelector(selector, options);
-    if (!moved) return origFrameDblclick(selector, options);
+    const timeout = options?.timeout ?? 30000;
+    const deadline = Date.now() + timeout;
+    const remainingMs = () => Math.max(0, deadline - Date.now());
+    const moved = await moveToFrameSelector(selector, options, false, remainingMs);
+    if (!moved) return origFrameDblclick(selector, { ...options, timeout: Math.max(1, remainingMs()) });
     await raw.down({ clickCount: 2 });
     await sleep(rand(30, 60));
     await raw.up({ clickCount: 2 });
@@ -784,7 +829,7 @@ function patchSingleFrame(
       await frameClick(selector, options);
     }
     await sleep(rand(50, 150));
-    await originals.keyboardPress(key);
+    await pressWithDelay(originals.keyboardPress, key, options);
   };
 
   (frame as any).pressSequentially = async (selector: string, text: string, options?: HumanActionOptions) => {
@@ -820,8 +865,11 @@ function patchSingleFrame(
     timeout?: number;
     trial?: boolean;
   }) => {
-    const srcBox = await firstFrameLocator(frame, source).boundingBox({ timeout: options?.timeout ?? 30000 }).catch(() => null);
-    const tgtBox = await firstFrameLocator(frame, target).boundingBox({ timeout: options?.timeout ?? 30000 }).catch(() => null);
+    const timeout = options?.timeout ?? 30000;
+    const deadline = Date.now() + timeout;
+    const remainingMs = () => Math.max(1, deadline - Date.now());
+    const srcBox = await firstFrameLocator(frame, source).boundingBox({ timeout: remainingMs() }).catch(() => null);
+    const tgtBox = await firstFrameLocator(frame, target).boundingBox({ timeout: remainingMs() }).catch(() => null);
 
     if (srcBox && tgtBox) {
       const sx = srcBox.x + srcBox.width / 2;
@@ -837,20 +885,24 @@ function patchSingleFrame(
       await sleep(rand(80, 150));
       await originals.mouseUp();
     } else {
-      return origFrameDragAndDrop(source, target, options);
+      return origFrameDragAndDrop(source, target, { ...options, timeout: Math.max(1, remainingMs()) });
     }
   };
 }
 
 
 function* iterFrames(page: Page): Generator<Frame> {
-  try {
-    const mainFrame = page.mainFrame();
-    yield mainFrame;
-    for (const child of mainFrame.childFrames()) {
-      yield child;
+  function* walk(frame: Frame): Generator<Frame> {
+    yield frame;
+    for (const child of frame.childFrames()) {
+      yield* walk(child);
     }
-  } catch {}
+  }
+  try {
+    yield* walk(page.mainFrame());
+  } catch (error) {
+    console.error('[cloakbrowser] Failed to enumerate page frames:', error);
+  }
 }
 
 

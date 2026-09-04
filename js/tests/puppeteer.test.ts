@@ -15,6 +15,7 @@ vi.mock("../src/geoip.js", () => ({
   resolveProxyGeo: vi.fn().mockResolvedValue({ timezone: null, locale: null }),
   maybeResolveGeoip: vi.fn().mockResolvedValue({}),
   resolveWebrtcArgs: vi.fn().mockImplementation((opts: any) => Promise.resolve(opts.args)),
+  appendWebrtcExitIp: vi.fn((args: any) => args),
 }));
 
 describe("puppeteer launch", () => {
@@ -28,6 +29,9 @@ describe("puppeteer launch", () => {
       newPage: vi.fn().mockResolvedValue({
         authenticate: vi.fn(),
       }),
+      // A real persistent Puppeteer browser arrives with an initial page; the
+      // license guard iterates browser.pages() to guard the pre-open page's nav.
+      pages: vi.fn().mockResolvedValue([]),
       close: vi.fn(),
     };
     vi.mocked(puppeteerMock.default.launch).mockResolvedValue(mockBrowser);
@@ -48,6 +52,15 @@ describe("puppeteer launch", () => {
     );
   });
 
+  it("forwards releaseChannel to binary resolution", async () => {
+    const { ensureBinary } = await import("../src/download.js");
+    const { launch } = await import("../src/puppeteer.js");
+
+    await launch({ releaseChannel: "preview" });
+
+    expect(ensureBinary).toHaveBeenCalledWith(undefined, undefined, "preview");
+  });
+
   it("includes stealth args by default", async () => {
     const { launch } = await import("../src/puppeteer.js");
     await launch();
@@ -63,6 +76,53 @@ describe("puppeteer launch", () => {
 
     const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
     expect(callArgs.args.some((a: string) => a.startsWith("--fingerprint="))).toBe(false);
+  });
+
+  it("headless (default) uses a fixed defaultViewport; headed uses null", async () => {
+    const { DEFAULT_VIEWPORT } = await import("../src/config.js");
+    const { launch } = await import("../src/puppeteer.js");
+
+    // Headless (default): deterministic viewport.
+    await launch();
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toEqual(DEFAULT_VIEWPORT);
+
+    // Headed: null so the page tracks the real window (else Puppeteer forces 800x600).
+    vi.mocked(puppeteerMock.default.launch).mockClear();
+    await launch({ headless: false });
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toBeNull();
+  });
+
+  it("honors an explicit launchOptions.defaultViewport (incl. null)", async () => {
+    const { launch } = await import("../src/puppeteer.js");
+
+    const custom = { width: 640, height: 480 };
+    await launch({ headless: true, launchOptions: { defaultViewport: custom } });
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toEqual(custom);
+
+    // Explicit null honored even in headless (would otherwise default to DEFAULT_VIEWPORT).
+    vi.mocked(puppeteerMock.default.launch).mockClear();
+    await launch({ headless: true, launchOptions: { defaultViewport: null } });
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toBeNull();
+  });
+
+  it("Puppeteer headless precedence: top-level headless wins over launchOptions.headless", async () => {
+    const { DEFAULT_VIEWPORT } = await import("../src/config.js");
+    const { launch } = await import("../src/puppeteer.js");
+
+    // Puppeteer sets headless AFTER the launchOptions spread, so top-level wins at
+    // launch — the viewport decision must follow the same (top-level) value.
+    await launch({ headless: true, launchOptions: { headless: false } });
+    const opts = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(opts.headless).toBe(true);
+    expect(opts.defaultViewport).toEqual(DEFAULT_VIEWPORT);
   });
 
   it("adds --proxy-server for string proxy", async () => {
@@ -84,30 +144,39 @@ describe("puppeteer launch", () => {
     expect(callArgs.args).toContain("--proxy-bypass-list=.google.com,localhost");
   });
 
-  it("uses page.authenticate fallback for http proxy on unsupported platform", async () => {
-    const config = await import("../src/config.js");
-    vi.spyOn(config, "getPlatformTag").mockReturnValue("darwin-arm64");
+  it("uses page.authenticate fallback for http proxy on free macOS", async () => {
+    // Free macOS lacks inline proxy auth → strip creds, use page.authenticate.
+    // getPlatformTag reads process.platform/arch at call time.
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const origArch = Object.getOwnPropertyDescriptor(process, "arch")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    Object.defineProperty(process, "arch", { value: "arm64", configurable: true });
     try {
       const { launch } = await import("../src/puppeteer.js");
       const browser = await launch({ proxy: "http://user:pass@proxy:8080" });
 
+      const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+      expect(callArgs.args).toContain("--proxy-server=http://proxy:8080");
       const page = await browser.newPage();
-      expect(page.authenticate).toHaveBeenCalledWith({
-        username: "user",
-        password: "pass",
-      });
+      expect(page.authenticate).toHaveBeenCalledWith({ username: "user", password: "pass" });
     } finally {
+      Object.defineProperty(process, "platform", origPlatform);
+      Object.defineProperty(process, "arch", origArch);
       vi.restoreAllMocks();
     }
   });
 
   it("passes inline creds via --proxy-server on supported platform (no page.authenticate)", async () => {
-    const config = await import("../src/config.js");
-    vi.spyOn(config, "getPlatformTag").mockReturnValue("linux-x64");
-    vi.spyOn(config, "getChromiumVersion").mockReturnValue("146.0.7680.177.5");
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const origArch = Object.getOwnPropertyDescriptor(process, "arch")!;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    Object.defineProperty(process, "arch", { value: "x64", configurable: true });
     try {
       const { launch } = await import("../src/puppeteer.js");
-      const browser = await launch({ proxy: "http://user:pass@proxy:8080" });
+      const browser = await launch({
+        proxy: "http://user:pass@proxy:8080",
+        browserVersion: "146.0.7680.177.5",
+      });
 
       const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
       expect(callArgs.args).toContain("--proxy-server=http://user:pass@proxy:8080");
@@ -115,6 +184,8 @@ describe("puppeteer launch", () => {
       const page = await browser.newPage();
       expect(page.authenticate).not.toHaveBeenCalled();
     } finally {
+      Object.defineProperty(process, "platform", origPlatform);
+      Object.defineProperty(process, "arch", origArch);
       vi.restoreAllMocks();
     }
   });
@@ -169,6 +240,32 @@ describe("puppeteer launch", () => {
     const page = await browser.newPage();
     expect(page.authenticate).not.toHaveBeenCalled();
   });
+
+  it("injects env when licenseKey provided", async () => {
+    const { launch } = await import("../src/puppeteer.js");
+    await launch({ licenseKey: "cb_pup_key" });
+    const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(callArgs.env).toBeDefined();
+    expect(callArgs.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_pup_key");
+  });
+
+  it("does not inject env without license key", async () => {
+    const { launch } = await import("../src/puppeteer.js");
+    await launch({});
+    const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(callArgs.env).toBeUndefined();
+  });
+
+  it("merges custom launchOptions.env with license key via puppeteer", async () => {
+    const { launch } = await import("../src/puppeteer.js");
+    await launch({
+      licenseKey: "cb_merge",
+      launchOptions: { env: { EXTRA: "val" } },
+    });
+    const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(callArgs.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_merge");
+    expect(callArgs.env!.EXTRA).toBe("val");
+  });
 });
 
 describe("puppeteer launchPersistentContext", () => {
@@ -182,6 +279,9 @@ describe("puppeteer launchPersistentContext", () => {
       newPage: vi.fn().mockResolvedValue({
         authenticate: vi.fn(),
       }),
+      // A real persistent Puppeteer browser arrives with an initial page; the
+      // license guard iterates browser.pages() to guard the pre-open page's nav.
+      pages: vi.fn().mockResolvedValue([]),
       close: vi.fn(),
     };
     vi.mocked(puppeteerMock.default.launch).mockResolvedValue(mockBrowser);
@@ -212,9 +312,27 @@ describe("puppeteer launchPersistentContext", () => {
     expect(callArgs.args.some((a: string) => a.startsWith("--fingerprint="))).toBe(true);
   });
 
-  it("uses page.authenticate fallback for http proxy in persistent context on unsupported platform", async () => {
-    const config = await import("../src/config.js");
-    vi.spyOn(config, "getPlatformTag").mockReturnValue("darwin-arm64");
+  it("headed persistent context uses null defaultViewport (tracks real window)", async () => {
+    const { DEFAULT_VIEWPORT } = await import("../src/config.js");
+    const { launchPersistentContext } = await import("../src/puppeteer.js");
+
+    await launchPersistentContext({ userDataDir: "./my-profile", headless: false });
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toBeNull();
+
+    vi.mocked(puppeteerMock.default.launch).mockClear();
+    await launchPersistentContext({ userDataDir: "./my-profile", headless: true });
+    expect(
+      vi.mocked(puppeteerMock.default.launch).mock.calls[0][0].defaultViewport
+    ).toEqual(DEFAULT_VIEWPORT);
+  });
+
+  it("uses page.authenticate fallback in persistent context on free macOS", async () => {
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const origArch = Object.getOwnPropertyDescriptor(process, "arch")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    Object.defineProperty(process, "arch", { value: "arm64", configurable: true });
     try {
       const { launchPersistentContext } = await import("../src/puppeteer.js");
       const browser = await launchPersistentContext({
@@ -222,12 +340,13 @@ describe("puppeteer launchPersistentContext", () => {
         proxy: "http://user:pass@proxy:8080",
       });
 
+      const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+      expect(callArgs.args).toContain("--proxy-server=http://proxy:8080");
       const page = await browser.newPage();
-      expect(page.authenticate).toHaveBeenCalledWith({
-        username: "user",
-        password: "pass",
-      });
+      expect(page.authenticate).toHaveBeenCalledWith({ username: "user", password: "pass" });
     } finally {
+      Object.defineProperty(process, "platform", origPlatform);
+      Object.defineProperty(process, "arch", origArch);
       vi.restoreAllMocks();
     }
   });
@@ -266,5 +385,28 @@ describe("puppeteer launchPersistentContext", () => {
     const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
     expect(callArgs.args).toContain("--fingerprint-timezone=Asia/Tokyo");
     expect(callArgs.args).toContain("--lang=ja-JP");
+  });
+
+  it("injects env with licenseKey in persistent context", async () => {
+    const { launchPersistentContext } = await import("../src/puppeteer.js");
+    await launchPersistentContext({
+      userDataDir: "./my-profile",
+      licenseKey: "cb_pup_persist",
+    });
+    const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(callArgs.env).toBeDefined();
+    expect(callArgs.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_pup_persist");
+  });
+
+  it("preserves custom env via launchOptions in persistent context", async () => {
+    const { launchPersistentContext } = await import("../src/puppeteer.js");
+    await launchPersistentContext({
+      userDataDir: "./my-profile",
+      licenseKey: "cb_cust",
+      launchOptions: { env: { CUSTOM: "val" } },
+    });
+    const callArgs = vi.mocked(puppeteerMock.default.launch).mock.calls[0][0];
+    expect(callArgs.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_cust");
+    expect(callArgs.env!.CUSTOM).toBe("val");
   });
 });

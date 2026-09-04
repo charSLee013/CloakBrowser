@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import { binaryInfo } from "../src/download.js";
-import { DEFAULT_VIEWPORT, getChromiumVersion } from "../src/config.js";
-import * as config from "../src/config.js";
+import { DEFAULT_VIEWPORT, getBinaryPath, getChromiumVersion, getPlatformTag } from "../src/config.js";
 
 describe("binaryInfo", () => {
   it("returns correct structure", () => {
@@ -11,11 +12,72 @@ describe("binaryInfo", () => {
       const info = binaryInfo();
 
       expect(info.version).toBe(getChromiumVersion());
+      expect(info.bundledVersion).toBeTruthy();
       expect(info.platform).toMatch(/^(linux|darwin|windows)-(x64|arm64)$/);
       expect(info.binaryPath).toBeTruthy();
       expect(typeof info.installed).toBe("boolean");
       expect(info.cacheDir).toContain("cloakbrowser");
     } finally {
+      if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
+      else delete process.env.CLOAKBROWSER_CACHE_DIR;
+    }
+  });
+
+  it("reports tier from the installed binary, not a cached license", () => {
+    // A valid, fresh license is cached but NO Pro binary is on disk → free.
+    const orig = process.env.CLOAKBROWSER_CACHE_DIR;
+    const dir = `/tmp/cloakbrowser-test-${Date.now()}-tier`;
+    fs.mkdirSync(dir, { recursive: true });
+    process.env.CLOAKBROWSER_CACHE_DIR = dir;
+    try {
+      fs.writeFileSync(
+        path.join(dir, ".license_cache"),
+        JSON.stringify({
+          key_sha256: "abc",
+          valid: true,
+          plan: "solo",
+          expires: null,
+          validated_at: Date.now() / 1000,
+        })
+      );
+      expect(binaryInfo().tier).toBe("free");
+
+      // Now drop a Pro binary on disk → pro.
+      fs.writeFileSync(path.join(dir, `latest_pro_version_${getPlatformTag()}`), "147.0.5555.1");
+      const bp = getBinaryPath("147.0.5555.1", true);
+      fs.mkdirSync(path.dirname(bp), { recursive: true });
+      fs.writeFileSync(bp, "fake");
+      fs.chmodSync(bp, 0o755);
+      const info = binaryInfo();
+      expect(info.tier).toBe("pro");
+      expect(info.version).toBe("147.0.5555.1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
+      else delete process.env.CLOAKBROWSER_CACHE_DIR;
+    }
+  });
+
+  it("threads the channel into the Pro download URL", () => {
+    const orig = process.env.CLOAKBROWSER_CACHE_DIR;
+    const dir = `/tmp/cloakbrowser-test-${Date.now()}-chan`;
+    fs.mkdirSync(dir, { recursive: true });
+    process.env.CLOAKBROWSER_CACHE_DIR = dir;
+    try {
+      // Same cached Pro binary satisfies both channels (version-keyed cache dir).
+      fs.writeFileSync(path.join(dir, `latest_pro_version_preview_${getPlatformTag()}`), "151.0.7900.10.1");
+      fs.writeFileSync(path.join(dir, `latest_pro_version_${getPlatformTag()}`), "151.0.7900.10.1");
+      const bp = getBinaryPath("151.0.7900.10.1", true);
+      fs.mkdirSync(path.dirname(bp), { recursive: true });
+      fs.writeFileSync(bp, "fake");
+      fs.chmodSync(bp, 0o755);
+
+      expect(binaryInfo(undefined, "preview").downloadUrl).toMatch(/\/api\/download\/latest\?channel=preview$/);
+      const stableUrl = binaryInfo(undefined, "stable").downloadUrl;
+      expect(stableUrl).toMatch(/\/api\/download\/latest$/);
+      expect(stableUrl).not.toContain("channel=preview");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
       if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
       else delete process.env.CLOAKBROWSER_CACHE_DIR;
     }
@@ -40,16 +102,100 @@ describe("composable Playwright launch helpers", () => {
     }
   });
 
-  it("exports buildLaunchOptions and humanizeBrowser from the package entrypoint", async () => {
+  it("forwards releaseChannel to Playwright binary resolution", async () => {
+    delete process.env.CLOAKBROWSER_BINARY_PATH;
+    const ensureBinary = vi.fn().mockResolvedValue("/fake/chrome");
+    vi.doMock("../src/download.js", () => ({ ensureBinary }));
+    try {
+      const { buildLaunchOptions } = await import("../src/playwright.js");
+
+      await buildLaunchOptions({ releaseChannel: "preview" });
+
+      expect(ensureBinary).toHaveBeenCalledWith(undefined, undefined, "preview");
+    } finally {
+      vi.doUnmock("../src/download.js");
+    }
+  });
+
+  it("exports composable helpers from the package entrypoint", async () => {
     const entry = await import("../src/index.js");
 
     expect(entry.buildLaunchOptions).toBeTypeOf("function");
+    expect(entry.buildContextOptions).toBeTypeOf("function");
     expect(entry.humanizeBrowser).toBeTypeOf("function");
   });
 
+  it("buildContextOptions returns Playwright context options without launching a browser", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { buildContextOptions } = await import("../src/index.js");
+
+    const options = buildContextOptions({
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      colorScheme: "dark",
+      contextOptions: {
+        userAgent: "Context/9.9",
+        viewport: { width: 9999, height: 9999 },
+        colorScheme: "light",
+        storageState: "state.json",
+        locale: "de-DE",
+        timezoneId: "Europe/Berlin",
+      },
+    });
+
+    expect(options).toMatchObject({
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      colorScheme: "dark",
+      storageState: "state.json",
+    });
+    expect(options.locale).toBeUndefined();
+    expect(options.timezoneId).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("buildContextOptions applies DEFAULT_VIEWPORT by default and allows null viewport", async () => {
+    const { buildContextOptions } = await import("../src/index.js");
+
+    expect(buildContextOptions().viewport).toEqual(DEFAULT_VIEWPORT);
+    expect(buildContextOptions({ viewport: null }).viewport).toBeNull();
+  });
+
+  it("buildContextOptions uses no viewport (null) when headed, so the page tracks the real window", async () => {
+    const { buildContextOptions } = await import("../src/index.js");
+
+    // Headed: no emulated viewport (CDP emulation would force outerWidth < innerWidth).
+    expect(buildContextOptions({ headless: false }).viewport).toBeNull();
+    // Headless keeps the deterministic default.
+    expect(buildContextOptions({ headless: true }).viewport).toEqual(DEFAULT_VIEWPORT);
+    // Explicit viewport always honored, even headed.
+    const custom = { width: 800, height: 600 };
+    expect(buildContextOptions({ headless: false, viewport: custom }).viewport).toEqual(custom);
+  });
+
+  it("buildContextOptions reads effective headless from launchOptions.headless", async () => {
+    const { buildContextOptions } = await import("../src/index.js");
+
+    // buildLaunchOptions spreads launchOptions LAST, so launchOptions.headless wins
+    // at the actual launch. Viewport must follow it — a raw headless:false (browser
+    // actually headed) must NOT get a fixed viewport (would reintroduce outer<inner).
+    expect(buildContextOptions({ launchOptions: { headless: false } }).viewport).toBeNull();
+    // And launchOptions.headless:true forces the deterministic viewport even if the
+    // top-level field said headed.
+    expect(
+      buildContextOptions({ headless: false, launchOptions: { headless: true } }).viewport,
+    ).toEqual(DEFAULT_VIEWPORT);
+  });
+
   it("buildLaunchOptions returns Playwright options without launching a browser", async () => {
-    const freshConfig = await import("../src/config.js");
-    vi.spyOn(freshConfig, "getPlatformTag").mockReturnValue("darwin-arm64");
+    // Free macOS lacks inline proxy auth → credentialed HTTP proxy goes through
+    // Playwright's proxy dict. Drive the platform via process.platform/arch since
+    // getPlatformTag reads them at call time (a config spy can't reach the
+    // intra-config gate call).
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const origArch = Object.getOwnPropertyDescriptor(process, "arch")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    Object.defineProperty(process, "arch", { value: "arm64", configurable: true });
     try {
       const { buildLaunchOptions } = await import("../src/index.js");
 
@@ -69,10 +215,49 @@ describe("composable Playwright launch helpers", () => {
         username: "user",
         password: "pass",
       });
+      expect(options.args).not.toContain(
+        "--proxy-server=http://user:pass@proxy.example:8080",
+      );
       expect(options.timeout).toBe(1234);
+      // No license key -> env is not injected
+      expect(options.env).toBeUndefined();
     } finally {
+      Object.defineProperty(process, "platform", origPlatform);
+      Object.defineProperty(process, "arch", origArch);
       vi.restoreAllMocks();
     }
+  });
+
+  it("buildLaunchOptions injects env with license key", async () => {
+    const { buildLaunchOptions } = await import("../src/index.js");
+
+    const options = await buildLaunchOptions({
+      licenseKey: "cb_test_key",
+      launchOptions: { timeout: 1234 },
+    });
+
+    expect(options.env).toBeDefined();
+    expect(options.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_test_key");
+    // launchOptions timeout still forwarded
+    expect(options.timeout).toBe(1234);
+  });
+
+  it("buildLaunchOptions preserves custom env via launchOptions", async () => {
+    const { buildLaunchOptions } = await import("../src/index.js");
+
+    const options = await buildLaunchOptions({
+      licenseKey: "cb_key",
+      launchOptions: {
+        timeout: 1234,
+        env: { MY_VAR: "custom" },
+      },
+    });
+
+    expect(options.env).toBeDefined();
+    // Custom env var preserved
+    expect(options.env!.MY_VAR).toBe("custom");
+    // License key injected
+    expect(options.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_key");
   });
 
   it("humanizeBrowser patches an existing browser only when requested", async () => {
@@ -107,7 +292,7 @@ describe.skipIf(!process.env.CLOAKBROWSER_BINARY_PATH)(
       const webdriver = await page.evaluate(() => navigator.webdriver);
       expect(webdriver).toBeFalsy();
 
-      const plugins = await page.evaluate(() => navigator.plugins.length);
+      const plugins = await page.evaluate(() => Array.from(navigator.plugins).length);
       expect(plugins).toBeGreaterThan(0);
 
       await browser.close();
@@ -314,8 +499,12 @@ describe("launchPersistentContext (unit)", () => {
   });
 
   it("forwards proxy string", async () => {
-    const freshConfig = await import("../src/config.js");
-    vi.spyOn(freshConfig, "getPlatformTag").mockReturnValue("darwin-arm64");
+    // Free macOS → credentialed HTTP proxy via Playwright's proxy dict, not
+    // inline --proxy-server. Drive platform via process.platform/arch.
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const origArch = Object.getOwnPropertyDescriptor(process, "arch")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    Object.defineProperty(process, "arch", { value: "arm64", configurable: true });
     try {
       const { launchPersistentContext } = await import("../src/playwright.js");
       await launchPersistentContext({
@@ -324,10 +513,15 @@ describe("launchPersistentContext (unit)", () => {
       });
 
       const args = mockChromium.launchPersistentContext.mock.calls[0][1];
-      expect(args.proxy.server).toBe("http://proxy:8080");
-      expect(args.proxy.username).toBe("user");
-      expect(args.proxy.password).toBe("pass");
+      expect(args.proxy).toEqual({
+        server: "http://proxy:8080",
+        username: "user",
+        password: "pass",
+      });
+      expect(args.args).not.toContain("--proxy-server=http://user:pass@proxy:8080");
     } finally {
+      Object.defineProperty(process, "platform", origPlatform);
+      Object.defineProperty(process, "arch", origArch);
       vi.restoreAllMocks();
     }
   });
@@ -392,5 +586,84 @@ describe("launchPersistentContext (unit)", () => {
     expect(args.locale).toBeUndefined();
     expect(args.timezoneId).toBeUndefined();
     expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("injects env when licenseKey param provided", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      licenseKey: "cb_persistent",
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeDefined();
+    expect(args.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_persistent");
+  });
+
+  it("does not inject env when no license key", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({ userDataDir: "/tmp/profile" });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeUndefined();
+  });
+
+  it("preserves custom launchOptions env merged with license key", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      licenseKey: "cb_merge",
+      launchOptions: {
+        env: { MY_VAR: "keep" },
+      },
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeDefined();
+    expect(args.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_merge");
+    expect(args.env!.MY_VAR).toBe("keep");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// License exit-code surfacing at launch() (mock playwright-core to reject)
+// ---------------------------------------------------------------------------
+
+describe("launch license error surfacing (unit)", () => {
+  const origEnv = process.env.CLOAKBROWSER_BINARY_PATH;
+
+  beforeEach(() => {
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (origEnv) {
+      process.env.CLOAKBROWSER_BINARY_PATH = origEnv;
+    } else {
+      delete process.env.CLOAKBROWSER_BINARY_PATH;
+    }
+  });
+
+  it("maps a license exit code to CloakBrowserLicenseError", async () => {
+    const licenseErr = new Error(
+      "browserType.launch: Target closed\nBrowser logs:\n- [pid=1] <process did exit: exitCode=77, signal=null>"
+    );
+    vi.doMock("playwright-core", () => ({
+      chromium: { launch: vi.fn().mockRejectedValue(licenseErr) },
+    }));
+    const { launch } = await import("../src/playwright.js");
+    const { CloakBrowserLicenseError } = await import("../src/license.js");
+    await expect(launch()).rejects.toBeInstanceOf(CloakBrowserLicenseError);
+  });
+
+  it("re-throws a non-license launch error unchanged (exact object)", async () => {
+    const other = new Error("some unrelated launch failure");
+    vi.doMock("playwright-core", () => ({
+      chromium: { launch: vi.fn().mockRejectedValue(other) },
+    }));
+    const { launch } = await import("../src/playwright.js");
+    await expect(launch()).rejects.toBe(other);
   });
 });

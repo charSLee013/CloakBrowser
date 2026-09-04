@@ -1,6 +1,6 @@
 """Unit tests for launch_context() — context kwargs, viewport defaults, close cleanup."""
 
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -35,6 +35,95 @@ def test_default_viewport(mock_launch, _mock_bin):
 
 @patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
 @patch("cloakbrowser.browser.launch")
+def test_release_channel_forwarded(mock_launch, _mock_bin):
+    browser, _ = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+
+    launch_context(release_channel="preview")
+
+    assert mock_launch.call_args.kwargs["release_channel"] == "preview"
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
+def test_headed_no_viewport(mock_launch, _mock_bin):
+    """Headed (headless=False): no emulated viewport — no_viewport=True so the page
+    tracks the real window (CDP viewport emulation would force outerWidth < innerWidth)."""
+    browser, context = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+    launch_context(headless=False)
+
+    ctx_kwargs = browser.new_context.call_args[1]
+    assert ctx_kwargs.get("no_viewport") is True
+    assert "viewport" not in ctx_kwargs
+
+
+def test_default_no_viewport_helper():
+    """_default_no_viewport defaults new_page()/new_context() to no_viewport=True,
+    but never overrides an explicit viewport (Playwright rejects passing both)."""
+    from cloakbrowser.browser import _default_no_viewport
+
+    browser = MagicMock()
+    orig_new_page = browser.new_page
+    orig_new_context = browser.new_context
+    _default_no_viewport(browser)
+
+    browser.new_page()
+    orig_new_page.assert_called_once_with(no_viewport=True)
+    browser.new_context()
+    orig_new_context.assert_called_once_with(no_viewport=True)
+
+    # Explicit viewport respected — no_viewport NOT injected.
+    orig_new_page.reset_mock()
+    browser.new_page(viewport={"width": 800, "height": 600})
+    orig_new_page.assert_called_once_with(viewport={"width": 800, "height": 600})
+
+
+@pytest.mark.asyncio
+async def test_default_no_viewport_helper_async():
+    """_default_no_viewport_async mirrors the sync helper for async new_page/new_context."""
+    from cloakbrowser.browser import _default_no_viewport_async
+
+    browser = MagicMock()
+    browser.new_page = AsyncMock()
+    browser.new_context = AsyncMock()
+    orig_new_page = browser.new_page
+    orig_new_context = browser.new_context
+    _default_no_viewport_async(browser)
+
+    await browser.new_page()
+    orig_new_page.assert_awaited_once_with(no_viewport=True)
+    await browser.new_context()
+    orig_new_context.assert_awaited_once_with(no_viewport=True)
+
+    # Explicit viewport respected — no_viewport NOT injected.
+    orig_new_page.reset_mock()
+    await browser.new_page(viewport={"width": 800, "height": 600})
+    orig_new_page.assert_awaited_once_with(viewport={"width": 800, "height": 600})
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
+def test_conflicting_viewport_kwargs_deduped(mock_launch, _mock_bin):
+    """If a caller forces no_viewport via **kwargs alongside viewport=, only one
+    reaches Playwright (which rejects both). The explicit kwargs value wins."""
+    browser, context = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+    launch_context(viewport={"width": 1280, "height": 800}, no_viewport=True)
+
+    ctx_kwargs = browser.new_context.call_args[1]
+    assert ctx_kwargs.get("no_viewport") is True
+    assert "viewport" not in ctx_kwargs
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
 def test_custom_viewport(mock_launch, _mock_bin):
     """Custom viewport overrides DEFAULT_VIEWPORT."""
     browser, context = _make_mock_browser()
@@ -46,6 +135,45 @@ def test_custom_viewport(mock_launch, _mock_bin):
 
     ctx_kwargs = browser.new_context.call_args
     assert ctx_kwargs[1]["viewport"] == custom
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
+def test_default_does_not_suppress_maximize(mock_launch, _mock_bin):
+    """No explicit viewport → let launch() auto-maximize (parity with JS/.NET)."""
+    browser, _ = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+    launch_context()
+
+    assert mock_launch.call_args.kwargs["_suppress_maximize"] is False
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
+def test_explicit_viewport_suppresses_maximize(mock_launch, _mock_bin):
+    """Caller chose a viewport → suppress auto --start-maximized (parity with JS/.NET)."""
+    browser, _ = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+    launch_context(viewport={"width": 800, "height": 600})
+
+    assert mock_launch.call_args.kwargs["_suppress_maximize"] is True
+
+
+@patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+@patch("cloakbrowser.browser.launch")
+def test_no_viewport_kwarg_suppresses_maximize(mock_launch, _mock_bin):
+    """Explicit no_viewport also counts as a chosen geometry → suppress."""
+    browser, _ = _make_mock_browser()
+    mock_launch.return_value = browser
+
+    from cloakbrowser.browser import launch_context
+    launch_context(no_viewport=True)
+
+    assert mock_launch.call_args.kwargs["_suppress_maximize"] is True
 
 
 @patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")

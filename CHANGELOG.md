@@ -6,7 +6,213 @@ Changes are tagged: **[wrapper]** for Python/JS wrapper, **[binary]** for Chromi
 
 ---
 
-## [Unreleased]
+## [0.5.10] — 2026-08-30
+
+- **[wrapper]** The first-launch welcome banner no longer aborts a launch on a legacy Windows console. On a non-UTF-8 (cp1252) console its arrow and dash characters raised `UnicodeEncodeError` on the binary-download path, which blocked license apply and profile launch (notably in CloakBrowser Manager). The banner is now ASCII and every write is guarded, so a cosmetic message can never stop a launch. Python, JavaScript, and .NET.
+- **[wrapper]** A requested GeoIP resolution that fails now aborts the launch instead of silently continuing on the container clock. Failure means the lookup times out, the database cannot be loaded, the lookup cannot complete, or timezone or locale stay unresolved; the default resolution timeout is raised from 5 to 20 seconds. Explicit timezone and locale overrides remain valid without an egress-IP result. Python, JavaScript, and .NET.
+- **[wrapper]** A license key the server rejects (invalid or expired), or one that cannot be validated at all (license server unreachable with no cached result), now raises a clear error instead of silently downloading the older free binary. Passing no key still uses the free binary as before. Python, JavaScript, and .NET.
+
+---
+
+## [0.5.9] — 2026-08-25
+
+- **[wrapper]** Fix `humanize=True` selecting the wrong element, so humanized actions now resolve the same visible target Playwright would (#512). Text matching ignores non-rendered document content, open Shadow DOM matches are ordered exactly as Playwright orders them for broad `first`/`nth` selectors, and elements with no box of their own (`display: contents`) get actionable geometry derived from their rendered text and visible descendants. Python, JavaScript Playwright/Puppeteer, and .NET.
+- **[wrapper]** Restore `get_by_*` locators (test id, placeholder/alt/title, text, label) under `humanize=True`. They had stopped resolving after an earlier internal read path was closed off; the engines are reimplemented in the isolated world so the locators work again without reopening that path. `get_by_role` and `>>` chaining remain unsupported, and the error now names what is supported. Python, JavaScript, and .NET.
+- **[wrapper]** Preserve the exact target element across a delayed humanized interaction, and skip the pointer check entirely under `force=True` to match Playwright. Pointer events are no longer dispatched if the original target is detached or replaced while the cursor is moving. Python, JavaScript, and .NET.
+- **[wrapper]** `cloakbrowser info` now reports concurrent session seats as used out of the plan limit instead of a bare count, so you can tell whether you are at capacity, and names the real reason when the count is unavailable (server unreachable, timeout, invalid key, inactive license, rate limited, or reported unknown while degraded) (#513). Adds `SessionSeats` / `getSessionSeats`; `get_active_session_count` keeps its signature. Python, JavaScript, and .NET.
+- **[wrapper]** Fix the license session guard on `launch_persistent_context_async` not having its denial path available after installation. Python.
+- **[wrapper]** Declare the URW base35 fonts explicitly in the published Docker image so the Latin fallback for Verdana, Georgia, Trebuchet MS and Tahoma cannot be silently dropped by a future window-manager change. No runtime change.
+
+---
+
+## [0.5.8] — 2026-08-18
+
+- **[wrapper]** Fix `humanize=True` actions (`fill`, `click`, `type`) failing with an element-not-attached error after a navigation driven by a click or form submission instead of `goto`. The pre-action element checks could stay bound to the previous document and never recover; they now refresh on every navigation. Regression from 0.5.6. Python, JavaScript Playwright/Puppeteer, and .NET.
+- **[wrapper]** Fix `humanize=True` `page.selectOption()` hanging until timeout instead of selecting. The saved original delegated back to the patched main-frame method and recursed indefinitely. JavaScript Playwright only; Python and .NET were unaffected.
+- **[wrapper]** Stop a humanized action from spending its full scroll budget (~7s) on an element that is already fully visible but off-center while the page is pinned at the top or bottom and cannot scroll any further toward the target zone. The scroll now bails immediately in that case instead of looping to no effect. Python, JavaScript, and .NET.
+- **[binary]** Chromium **150.0.7871.114.6** (Pro Stable, Linux x64 + arm64 and Windows x64) — 71 source-level patches. Linux advances from `150.0.7871.114.4`; Windows advances from `150.0.7871.114.3`. macOS remains on Stable `150.0.7871.114.3`.
+  - **Identity and hardware:** expanded the Windows hardware-profile pool and tightened alignment between graphics, CPU, memory, and display characteristics. Fixed seeds may resolve to a different complete hardware identity than on the previous Stable build.
+  - **Windows fidelity:** completed text measurements and font availability across a broader real-world font set, refined platform-specific path handling, improved headed window geometry, and expanded locale coverage including Greek.
+  - **Browser consistency:** aligned identity across top-level and nested frames under automation overrides, normalized storage reporting across contexts, improved deterministic rendering behavior, stabilized native Linux profiles across seeds, and unified the reported browser build number.
+  - **Network identity:** improved consistency for IPv4, IPv6, dual-stack, direct, proxied, and automatically located sessions, including automatic proxy fallback for licensing connectivity.
+  - **Runtime and compatibility:** improved extension and worker reliability under cross-platform profiles, strengthened interrupted-session cleanup and local license diagnostics, and improved host-font isolation for cross-platform personas.
+
+---
+
+## [0.5.7] — 2026-08-11
+
+- **[wrapper]** Preserve the caller-specified `delay` for humanized key press actions instead of replacing it with an immediate key-up or an internally generated hold time. Covers page, frame, locator, element-handle, and keyboard press paths across Python, JavaScript Playwright/Puppeteer, and .NET.
+- **[wrapper]** Apply `humanize=True` recursively to frames nested more than one level deep instead of patching only the main frame and its direct children. Python and JavaScript Playwright.
+
+---
+
+## [0.5.6] — 2026-08-08
+
+- **[wrapper]** Fix `humanize=True` triggering invisible CAPTCHA challenges during clicks. Humanized pre-click checks are now stealth-safe without sacrificing actionability, smooth scrolling, accurate targeting, or common selector support. Python, JavaScript, and .NET.
+- **[wrapper]** Humanize frames created after page load instead of leaving dynamically attached frames with raw Playwright/Puppeteer behavior. Python, JavaScript, Puppeteer, and .NET.
+- **[wrapper]** Fix .NET `NewCDPSessionAsync()` throwing `NullReferenceException` when passed a wrapped page or frame. Adds `Humanize.Unwrap()` for APIs that require Playwright's concrete handles.
+
+---
+
+## [0.5.5] — 2026-08-05
+
+- **[wrapper]** **`cloakbrowser info --proxy <url>` now resolves the exit IP, timezone, and locale a launch would apply through that proxy.** Previously `info` only reported whether the GeoIP database file was present; it never resolved anything, so there was no way to confirm a proxy hands you a timezone and locale that match its exit IP before launching. Passing `--proxy` runs the same resolution `geoip=True` uses at launch (downloading the GeoIP database if it is not cached) and prints the exit IP, timezone, and locale, in text and `--json` output. Plain `info` is unchanged and still makes no network call; it now points at the new flag. Python, JavaScript, and .NET.
+- **[wrapper]** **`humanize=True` no longer raises `TypeError` on Python 3.14 with a license key set.** Python 3.14 made `functools.partial` a method descriptor. The license guard stored each wrapped page method as a `partial`, relying on it *not* being a descriptor so that humanize could copy the methods onto a holder object and read them back unchanged. Under 3.14 the `partial` re-bound on access and injected a spurious first argument, so the first humanized page call raised `TypeError` (#488). The guard now wraps methods in a non-descriptor callable, inert wherever it is stored, on every Python version. Python only; JavaScript and .NET were unaffected.
+- **[wrapper]** **`humanize=True` no longer misses clicks on pages that are still loading.** When a page kept reflowing after the element was scrolled into view, the wrapper waited for the position to settle but never scrolled again — by then the element could have been pushed off screen, so the click was dispatched at coordinates outside the viewport and landed on nothing. The action reported success and the click had simply not happened. The element is now re-scrolled into view after the settle wait, and the pointer-events check no longer downgrades an already-confirmed miss to "undetermined" when a later probe times out, so a click that cannot land raises instead of passing silently. Measured on a page reflowing for 10–25 seconds: previously a silent miss after ~32s, now a successful click. Pages that reflow longer than the call's timeout still raise, as before. Python, JavaScript, and .NET.
+
+---
+
+## [0.5.4] — 2026-08-04
+
+- **[wrapper]** A concurrent-session limit that is reached *after* the browser has already connected now surfaces as a clear `CloakBrowserLicenseError` on your first page action, instead of a generic "target closed" error (#477). It covers the persistent-context flow, where the first page is already open, as well as pages created from your own browser contexts. Python, JavaScript (Playwright + Puppeteer), and .NET.
+
+---
+
+## [0.5.3] — 2026-07-30
+
+- **[wrapper]** When the Windows font-metrics profile is requested, the launch feature set now matches a stock Chrome install rather than Playwright's test-harness defaults, which switch off a feature stock Chrome ships enabled. Merged into any `--enable-features` value you pass instead of adding a second flag. Python, JavaScript, and .NET.
+- **[wrapper]** **A second browser launched from the same Node process no longer inherits the first one's proxy identity.** When one process called `launch()` more than once with different proxies, every launch after the first reused the earlier connection to the exit-IP lookup service, because Node pools those connections by destination and the destination is the same for every proxy. The tunnel opened through the new proxy was built and then discarded, so later browsers were given the first proxy's exit IP, timezone and locale while their traffic correctly went out through their own proxy. Each launch now resolves its own exit IP. Single-launch processes were never affected. JavaScript only; Python and .NET open a fresh client per lookup.
+- **[wrapper]** Fix GeoIP and WebRTC exit-IP resolution dropping the credentials of an authenticated HTTP proxy given as a settings object — `{"server": ..., "username": ..., "password": ...}` — instead of a URL with inline credentials (#469). Only SOCKS proxies kept their credentials, so the HTTP lookup was rejected and fell back to resolving the proxy gateway's hostname. That returns a real address, so resolution appeared to succeed while reporting the gateway's timezone and locale rather than the session's actual exit IP, and `--fingerprint-webrtc-ip=auto` was dropped entirely. Both forms of the same proxy now resolve identically. Python, JavaScript, and .NET.
+- **[wrapper]** **`cloakbrowser info` no longer aborts partway through on a Windows console.** `cmd.exe` defaults to a code page that cannot represent the report's check mark and arrow, so the command stopped with an encoding error at the first one and the remaining diagnostics were never printed. Those marks now degrade to plain text when the console cannot take them, per character. UTF-8 consoles, including Linux, macOS and Windows Terminal, are unchanged. Python.
+- **[wrapper]** **`cloakbrowser info` no longer reports a false launch failure on Windows.** Chromium handles `--version` only on POSIX, so on Windows the switch was ignored and a browser started instead of printing — the probe then timed out and a healthy install was reported as broken, briefly putting a window on screen each run. The check now exits immediately on Windows, without a window, and still fails loudly on a genuinely broken binary; it reports no version there, since nothing is printed. Linux and macOS are unchanged. Python, JavaScript, and .NET.
+
+## [0.5.2] — 2026-07-25
+
+- **[wrapper]** **Preview release channel.** Opt in with `release_channel="preview"` (`releaseChannel` in JavaScript, `ReleaseChannel` in .NET) or `CLOAKBROWSER_RELEASE_CHANNEL=preview` for every launch and CLI command. Preview means the newest build available for the current platform: a newer Preview is selected when present, otherwise it resolves to Stable, including when Stable has moved ahead. It is a standing setting, not a version pin, so a platform with no Preview build simply tracks Stable until one exists. CLI diagnostics report the requested and resolved channel plus the exact version that will launch. Python, JavaScript, and .NET.
+- **[wrapper]** `cloakbrowser info` now prints the wrapper version alongside the binary diagnostics, so a bug report carries both without a second command. Python, JavaScript, and .NET.
+- **[docker]** `cloakserve` gained `POST /fingerprint/{seed}/close`, which tears down that seed's browser immediately and frees its slot instead of waiting out the idle timeout. The profile is preserved and the call is idempotent.
+- **[binary]** Chromium **150.0.7871.114.4** (Pro, Linux x64 + arm64) — 73 source-level patches (up from 71). A coherence release. Windows and macOS stay on Stable `150.0.7871.114.3`; the fixes below that apply to those platforms ship with their next build.
+  - **Consistent identity under CDP user-agent overrides** — subframes no longer disagree with the top frame about the browser identity when a custom user agent is set over CDP. Mainly affects Puppeteer, which sets one on every page session.
+  - **Closer Windows persona text rendering** — font availability and text measurements track a real Windows install more closely.
+  - **Complete locale coverage** — every supported locale now resolves to a coherent profile, with Greek (`el-GR`, `el-CY`) added.
+  - **Headed window geometry coherence** on the Windows persona; headless is unchanged.
+  - **More stable results across seeds** when the spoofed platform matches the host, i.e. the native Linux persona.
+  - **One consistent reported build number** — `--version` and `chrome://version` now read the public version from a single source. Web-reachable surfaces, including the user agent, are unchanged.
+  - No unsupported-flag warning bar when the sandbox is disabled, as required when running as root (e.g. in Docker).
+
+## [0.5.1] — 2026-07-23
+
+- **[wrapper]** Fix GeoIP exit-IP resolution through authenticated HTTP proxies in the JavaScript wrapper. The CONNECT request sent the proxy's address in the `Host` header instead of the tunnel target, which strict proxies (e.g. Oxylabs backconnect) reject; the wrapper then silently fell back to the proxy gateway's location, producing a wrong timezone/locale for the session's real exit IP. The `Host` header now names the tunnel target per RFC 9110. JavaScript only; Python and .NET were unaffected.
+
+## [0.5.0] — 2026-07-22
+
+- **[wrapper]** **Free tier via GitHub sign-in.** New `cloakbrowser login` command: sign in with GitHub to get a free license key (or save a paid key), `cloakbrowser logout` to revert. The launch banner and `cloakbrowser info` are now tier-aware (keyless / free / pro). Free keys always track the latest free build. Python, JavaScript, and .NET.
+- **[wrapper]** Fix `geoip=True` overriding a timezone or locale that was passed explicitly as a raw flag via `args=` (`--fingerprint-timezone`, `--lang`, `--fingerprint-locale`). A raw flag now counts as explicit and is preserved, matching the behavior of the `timezone=`/`locale=` parameters; GeoIP only fills the values you did not set. Python, JavaScript, and .NET.
+
+## [0.4.13] — 2026-07-22
+
+- **[wrapper]** Fix the GeoIP database never refreshing and re-downloading on every launch (#458). The atomic replace used a rename that cannot overwrite an existing file on Windows, so a stale database was never updated and each launch re-fetched the ~70 MB database in a loop; with no lock, concurrent launches each started their own download. The refresh now replaces the file atomically and guards against duplicate concurrent downloads. Python, JavaScript, and .NET.
+- **[wrapper]** Quote `cloakbrowser[geoip]` in the install hints printed when the optional GeoIP dependency is missing (#459), so copy-pasting the hint into a shell that globs brackets (e.g. zsh) no longer errors.
+
+## [0.4.12] — 2026-07-18
+
+- **[binary]** Chromium **150.0.7871.114.3** (Pro, all platforms) — 71 source-level patches. A full rebase onto the Chromium 150 line with the complete patch set ported forward, plus a round of coherence work. Pro license required; v146 stays free.
+  - **Closer alignment with a real Chrome install** across speech and language profiles, font handling, and graphics parameters.
+  - **More self-consistent identities** — values that a real browser reports consistently now stay consistent across repeat reads and across launch modes.
+  - **macOS coherence** — display characteristics hold together across headed and headless launches.
+  - **The reported Chrome version tracks real Chrome**, independent of the version we build from.
+  - New `--fingerprint-sapi-voices=false` for the Windows voice tables (see the flags table in the README).
+  - **Clearer license failures** — the license gate now exits with a distinct code per denial reason, which the wrapper surfaces as a specific `CloakBrowserLicenseError`.
+- **[wrapper]** Fix the first-launch banner reporting the wrong Pro major version — a Pro install downloading the Chromium 150 binary printed "Pro active (v148)", and the free-tier upgrade hint named the same stale version. Cosmetic only; binary download, verification, and launch were unaffected. Python, JS, and .NET.
+
+## [0.4.11] — 2026-07-16
+
+- **[wrapper]** When the Pro binary refuses a launch for a license reason, `launch()` now raises a clear `CloakBrowserLicenseError` (invalid, expired, or missing key; session limit reached; license server unreachable; or a local config problem) instead of an opaque "target/browser closed" error. Non-license launch failures are re-raised unchanged. New exported `CloakBrowserLicenseError` type. Python, JavaScript, Puppeteer, and .NET.
+- **[wrapper]** Authenticated HTTP/HTTPS proxies now use the browser's native proxy authentication on every platform whose binary supports it — resolved per platform and binary version — and fall back to the standard proxy path on older binaries that don't. Fixes credentialed HTTP/HTTPS proxies on macOS and ARM, which previously could not use the native path. Python, JavaScript, Puppeteer, and .NET.
+- **[wrapper]** `cloakbrowser info` now shows the number of Pro sessions currently in use ("Sessions: N seats in use") for a valid Pro license, so you can see how many concurrent sessions are running without contacting support. The count is never cached, skipped under `--quick`, and reports "unavailable" rather than a guessed number when it cannot be determined. Python, JS, and .NET.
+
+## [0.4.10] — 2026-07-09
+
+- **[wrapper]** Fix JS CLI silently exiting with no output when run via `npx`/`node_modules/.bin` (#427). The entry-point guard compared `import.meta.url` to an unresolved `process.argv[1]`; symlinked bin installs (npm/pnpm/npx) never matched, so no subcommand ran. Now realpath-resolves the invoked path before comparing.
+- **[wrapper]** Fix `humanize=True` breaking interactions with elements **inside iframes** (#428). `frame.locator("#btn").click()` / `fill()` / `hover()` / etc. (and the frame-level `frame.click(...)` equivalents) now resolve the selector in the owning sub-frame's own document instead of misrouting to the top page, which previously raised `ElementNotAttachedError`. Humanized mouse motion is preserved inside iframes. Python only (the JS and .NET wrappers were already frame-correct).
+
+## [0.4.9] — 2026-07-09
+
+- **[wrapper]** Free-tier launch banner and `cloakbrowser info` upgrade hint now surface the **7-day free Pro trial** (Chromium 148). Python, JS, and .NET.
+- **[wrapper]** `info`/`update` never diverge from the Pro build that actually launches — `info` now shows both the cached build that will launch and the server's latest Pro version so the two can no longer silently disagree. Unpinned launches prefer the server's latest when it's newer than (or replaces a missing) cached build; `update` is license-aware (a valid Pro key updates the Pro binary, everyone else updates free); the background Pro update check is now a rate-limited foreground check (one call/hour, honors `CLOAKBROWSER_AUTO_UPDATE=false`); a valid Pro license never silently falls back to free; binary verification failures now surface verbatim instead of falling back to a cached build. Python, JS, and .NET.
+- **[wrapper]** `info`/`doctor` Windows-font check now covers the full 8-font set (adds the two monospace fonts) and reports a strict N/8 count, with the launch-time warning firing on any incomplete set rather than only a fully-missing one. Adds a separate Office-font group (10 fonts) reported as informational N/10 with no install nudge. Python, JS, and .NET.
+
+## [0.4.8] — 2026-07-05
+
+- **[binary]** Chromium **148.0.7778.215.5** (Pro, Windows + Linux; macOS follows) — the biggest fingerprint update yet. Pro license required; v146 stays free.
+  - **More common, more coherent hardware identities** — each `--fingerprint` seed is built from the most common real-world hardware values (screen, GPU, RAM, CPU cores, color depth, fonts, audio), chosen together so they form a popular, self-consistent device with no internal contradictions.
+  - Deeper, more consistent **Windows persona** — expanded and localized font populations, tighter graphics/display alignment, and seed-coherent screen size, color depth, and audio across browser- and OS-level signals.
+  - Expanded **NVIDIA GPU profiles**, each matched to a plausible CPU, RAM, and screen combination.
+  - **Window and screen geometry coherence** in both headed and headless modes (pairs with the wrapper's new maximized-window default).
+  - Greater **WebGL and WebGPU realism**, including consistent behavior under timing inspection.
+  - **Cleaner proxy behavior** — better proxy-auth handling and less proxy-specific reload and cache leakage.
+  - New **pass-through debug mode** (`--fingerprint=off`) and a **third-party-cookie compatibility flag** (`--fingerprint-allow-3p-cookies`).
+  - **Runtime Pro license sessions** — privacy-preserving groundwork for future session-limit enforcement (`--license-through-proxy` opts these calls onto your proxy, Linux only for now).
+- **[wrapper]** `geoip=True` now works **without a proxy** — on a direct connection it resolves the machine's own public IP for timezone, locale, and the WebRTC exit IP (previously it no-oped without a proxy, leaving UTC + `en-US` in bare Docker/cloud launches). Locale coverage expanded from 50 to **132 countries**. Python, JS, and .NET.
+- **[wrapper]** Headed and headless launches now open **maximized** on the newest Pro binaries (version-gated, same threshold as the headless no-viewport default), so the window fills the spoofed screen and window/screen geometry stays self-consistent. Suppressed when you set an explicit window size/position or viewport; older and free binaries are unchanged. Python, JS, and .NET.
+- **[docs]** Documented the Chromium 148+ pass-through and compatibility flags you can pass via `args`: `--fingerprint=off` (native pass-through debug mode), `--fingerprint-allow-3p-cookies` (third-party-cookie compatibility for reCAPTCHA v3 / SSO / payment challenges), and `--license-through-proxy` (route license/session calls through your proxy, Linux only for now).
+
+## [0.4.7] — 2026-07-02
+
+- **[docker]** Update the public `cloaktest` suite to use free-tier-stable bot-detection checks while Pro continues to verify reCAPTCHA v3 at 0.9. The Docker smoke test now runs Sannysoft, Incolumitas, Rebrowser, deviceandbrowserinfo, BrowserScan, and CreepJS lies/noise=false; FingerprintJS and reCAPTCHA v3 are no longer hard-pass checks for the free v146 image.
+
+## [0.4.6] — 2026-07-02
+
+- **[wrapper]** The resolved Pro license key is now passed to the browser process at launch (via `CLOAKBROWSER_LICENSE_KEY`) so the Pro binary can authenticate itself, including when you supply a custom `env`. Fixes launch failures on the newest Pro binaries. Python, JS, and .NET.
+- **[wrapper]** Headless launches on the newest Pro binaries now track the real screen surface instead of a fixed emulated viewport, keeping window geometry self-consistent (version-gated — older and free binaries keep the deterministic headless viewport). Passing an explicit `viewport=`/`no_viewport` (Python) or `viewport`/`defaultViewport` (JS) still overrides. Python, JS, and .NET.
+
+## [0.4.5] — 2026-06-29
+
+- **[wrapper]** **`info` is now a full diagnostics command** — it reports the binary that will actually launch given your license, runs a launch test (`chrome --version`, plus a missing-shared-library probe on Linux), validates the license key to show the real tier (`free`/`solo`/`team`/`business`, or `invalid`), and checks Windows-font availability (Linux), the GeoIP database, and optional dependencies. `--quick` skips the launch test; `--json` emits machine-readable output. Python, JS, and .NET.
+- **[wrapper]** One-time startup notice when spoofing the Windows platform on a Linux host without Windows fonts installed, with guidance to install them for best results. Best-effort and silent on error; suppress with `CLOAKBROWSER_SUPPRESS_FONT_WARNING=1`. Python, JS, and .NET.
+- **[wrapper]** The first-launch banner now re-shows to free users every 3 days (Pro users still see it once). Python, JS, and .NET.
+
+## [0.4.4] — 2026-06-27
+
+- **[wrapper]** **Exact version pinning / rollback** — pin a specific Chromium build with `browser_version=` (`browserVersion` in JS, `BrowserVersion` in .NET) or the `CLOAKBROWSER_VERSION` environment variable, e.g. `launch(browser_version="148.0.7778.215.2")`. Works for both Free and Pro binaries and lets you roll back if a new build regresses on your site. A pin never overwrites the cached "latest" marker, so a later unpinned launch returns to the newest build. Python, JS, and .NET.
+- **[wrapper]** The Pro version check now sends the client platform so each OS resolves its own latest build independently — a new release for one platform no longer affects the others. Python, JS, and .NET.
+- **[binary]** Chromium **148.0.7778.215.3** (Pro) — fingerprint fixes and alignment across Linux, Windows, and macOS (Apple Silicon + Intel). Pro license required; v146 stays free.
+
+## [0.4.3] — 2026-06-24
+
+- **[wrapper]** **.NET 8 / C# client** — CloakBrowser now ships as a NuGet package (`CloakBrowser`), mirroring the Python and JS wrappers. Contributed by [@evelaa123](https://github.com/evelaa123) in PR #385.
+- **[wrapper]** **macOS Pro is now available** — the latest binary (Chromium 148.0.7778.215.2) downloads on macOS (Apple Silicon + Intel) with a Pro license, the same as Linux and Windows. v146 stays free.
+- **[wrapper]** A valid Pro license now hard-fails on a Pro download error on *every* platform instead of silently downgrading to the free binary. The temporary macOS-only free fallback added in 0.4.2 is removed now that the macOS Pro build ships. Python, JS, and .NET.
+
+## [0.4.2] — 2026-06-23
+
+- **[wrapper]** macOS Pro licenses now fall back to the free binary (macOS Pro build coming) instead of failing to launch. Transient and signature-verification failures still hard-fail. Python and JS.
+
+## [0.4.1] — 2026-06-23
+
+- **[wrapper]** Humanize: fix "Viewport size not available" crash on headed launches. Headed mode defaults to `no_viewport` (since 0.4.0), so `page.viewport_size` is `None` — human scroll now falls back to the live `window.innerWidth`/`window.innerHeight`. Covers Playwright (Python sync/async, JS) and Puppeteer.
+- **[wrapper]** **[docker]** Widevine: opt-in CDM auto-fetch for persistent contexts. Set `CLOAKBROWSER_FETCH_WIDEVINE` and the Docker entrypoint pulls the Widevine CDM from Google's component server (arch-aware, SHA-256 verified, atomic, cached), so DRM playback works without a local Chrome to copy from. Off by default; bare-metal Linux users can run `bin/fetch-widevine.py` directly.
+- **[meta]** First-launch banner now promotes the Pro tier (header badge dropped); refreshed README test-results stamp to Jun 2026 / Chromium 148.
+
+## [0.4.0] — 2026-06-22
+
+- **[wrapper]** **CloakBrowser Pro**: all launch functions now accept a `license_key` parameter (`licenseKey` in JS); a key can also be supplied via the `CLOAKBROWSER_LICENSE_KEY` environment variable or a `~/.cloakbrowser/license.key` file. With a valid key the latest binary is downloaded from cloakbrowser.dev; without one, the free binary continues to download from GitHub Releases exactly as before. License validation is cached locally for 24h, and the Pro binary is authenticated with the same pinned Ed25519 signature as the free binary. A valid key whose Pro download or signature check fails surfaces a clear error rather than silently downgrading to the free binary. Adds `validate_license`/`LicenseInfo` exports and a `tier` field on `binary_info()`. Details: <https://cloakbrowser.dev>
+- **[wrapper]** **Security**: downloaded binaries are now verified against a pinned Ed25519 signature on the published `SHA256SUMS` (a detached `SHA256SUMS.sig`), so a compromised download mirror can no longer certify a tampered binary — the previous same-origin checksum proved integrity but not authenticity (#308). The signed manifest also binds the release version, rejecting a forced downgrade to an older signed build. Verification is mandatory on the official download path; silent auto-update is preserved for everyone because only a constant public key is pinned, not per-version hashes. Older installed wrappers are unaffected.
+- **[wrapper]** Headed launches no longer apply a fixed emulated viewport on top of the real browser window — the page now tracks the actual window so window-geometry stays self-consistent. Headless keeps a deterministic viewport (unchanged). Applies across `launch`, `launch_context`, `launch_persistent_context` (+ async) and the JS Playwright/Puppeteer wrappers. Passing an explicit `viewport=`/`no_viewport` (Python) or `viewport`/`defaultViewport` (JS) still works exactly as before.
+- **[wrapper]** **Breaking**: removed the optional `patchright` backend. The `backend` parameter and `CLOAKBROWSER_BACKEND` environment variable no longer exist, and the `cloakbrowser[patchright]` extra is gone. Stock Playwright is now the only backend. The stealth binary handles automation-signal suppression at the C++ level — patchright added no measurable benefit on top of it (identical reCAPTCHA v3 score to plain Playwright) while breaking proxy auth and `add_init_script` (#27). Callers passing `backend=...` will get a `TypeError`; remove the argument.
+- **[binary]** **CloakBrowser Pro — first Pro build**: Chromium `148.0.7778.215.2` for linux-x64, linux-arm64, and windows-x64 — 59 source-level fingerprint patches (up from 58 on 146). macOS builds to follow. Available to Pro subscribers at cloakbrowser.dev; v146 remains free on GitHub Releases.
+- **[binary]** Rebased the full patch set across two Chromium major versions — 146 → 147 → 148 — re-applying and adapting every patch to current Chromium internals
+- **[binary]** Cross-API fingerprint consistency improvements for Chromium 148 profiles
+- **[binary]** WebRTC fingerprint hardening — network signals matched to real Chrome
+- **[binary]** Font metric alignment for Windows profiles via the opt-in `--fingerprint-windows-font-metrics` flag — requires Windows fonts installed (see README "Font Setup on Linux")
+
+## [0.3.32] — 2026-06-20
+
+- **[wrapper]** **Security**: Windows binary extraction — pass archive/destination paths to PowerShell via env vars instead of interpolating into the `-Command` string, closing a code-injection shape on paths containing single quotes (e.g. `C:\Users\O'Brien`)
+- **[wrapper]** Widevine: auto-seed CDM hint file for persistent contexts on Linux, so DRM playback works without manual pre-seeding
+- **[wrapper]** `cloakserve`: rewrite CDP WebSocket URLs so clients connect through the proxy correctly (thanks [@honor2030](https://github.com/honor2030), #234)
+- **[wrapper]** `cloakserve`: add idle cleanup for seeded profiles (thanks [@Kumario1](https://github.com/Kumario1), #352)
+- **[meta]** Fix `recaptcha_score.py` example — wait for the reCAPTCHA score to render before screenshot (thanks [@igo](https://github.com/igo) for the report, #374)
+- **[meta]** Bump GitHub Actions in the actions group (#358)
+
+## [0.3.31] — 2026-05-26
+
+- **[wrapper]** Route HTTP proxy credentials through `--proxy-server` flag, removing the need for Playwright's proxy auth handler on HTTP proxies
+- **[wrapper]** JS: export `buildContextOptions` helper for custom context creation (thanks [@honor2030](https://github.com/honor2030), #262)
+- **[wrapper]** Humanize: fix iframe coordinate offset in pointer-events check (thanks [@eofreternal](https://github.com/eofreternal), #303)
+- **[wrapper]** Humanize: use shared deadline for timeout budget in frame and ElementHandle methods (#307)
+- **[docker]** Clean up stale Xvfb lock so container survives restarts (thanks [@sparanoid](https://github.com/sparanoid), #284)
+- **[meta]** Add pip and npm ecosystems to Dependabot, bump GitHub Actions (#309)
 
 ## [0.3.30] — 2026-05-21
 

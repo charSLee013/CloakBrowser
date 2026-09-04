@@ -1,16 +1,30 @@
 /**
  * cloakbrowser-human — Human-like scrolling via mouse wheel events.
+ *
+ * Selector geometry and live DOM scroll state are read only through the CDP
+ * isolated world. ElementHandle callers may still supply their own exact box.
  */
 
 import type { Page } from 'playwright-core';
-import { HumanConfig, rand, randRange, randIntRange, sleep } from './config.js';
-import { RawMouse, humanMove } from './mouse.js';
+import { type HumanConfig, rand, randRange, randIntRange, sleep } from './config.js';
+import { type RawMouse, humanMove } from './mouse.js';
+import {
+  buildBoxJs, evalParsed, getWorld, OK, NOT_FOUND, UNSUPPORTED,
+  EVALUATION_FAILED, VIEWPORT_JS, StealthEvaluationError,
+  StealthWorldUnavailableError, UnsupportedHumanizeSelectorError,
+} from './stealthDom.js';
 
-interface ElementBounds {
+export interface ElementBounds {
   x: number;
   y: number;
   width: number;
   height: number;
+  targetId?: number;
+}
+
+export interface SelectorBounds extends ElementBounds {
+  targetId: number;
+  gen: number;
 }
 
 function isInViewport(
@@ -23,6 +37,28 @@ function isInViewport(
   const zoneTop = viewportHeight * cfg.scroll_target_zone[0];
   const zoneBottom = viewportHeight * cfg.scroll_target_zone[1];
   return topEdge >= zoneTop && bottomEdge <= zoneBottom;
+}
+
+const SCROLL_JS =
+  '(() => { const e = document.scrollingElement || document.documentElement;' +
+  ' return { y: window.scrollY, maxY: Math.max(0, e.scrollHeight - e.clientHeight) }; })()';
+
+async function readScrollState(page: Page): Promise<{ y: number; maxY: number }> {
+  const world = getWorld(page);
+  if (!world) throw new StealthWorldUnavailableError();
+  try {
+    const state = await world.evaluate(SCROLL_JS);
+    if (
+      !state || typeof state !== 'object' ||
+      typeof state.y !== 'number' || typeof state.maxY !== 'number'
+    ) {
+      throw new StealthEvaluationError('<scroll-state>');
+    }
+    return state;
+  } catch (error) {
+    if (error instanceof StealthEvaluationError) throw error;
+    throw new StealthEvaluationError('<scroll-state>');
+  }
 }
 
 async function smoothWheel(raw: RawMouse, delta: number, cfg: HumanConfig): Promise<void> {
@@ -38,23 +74,25 @@ async function smoothWheel(raw: RawMouse, delta: number, cfg: HumanConfig): Prom
   }
 }
 
-/**
- * Humanized scrolling that takes an arbitrary ``getBox`` callable.
- *
- * Used by both ``scrollToElement`` (selector-based) and the ElementHandle
- * ``scrollIntoViewIfNeeded`` patch so the same accelerate → cruise →
- * decelerate → overshoot behavior runs everywhere.
- */
-export async function humanScrollIntoView(
+export async function humanScrollIntoView<T extends ElementBounds>(
   page: Page,
   raw: RawMouse,
-  getBox: () => Promise<ElementBounds | null>,
+  getBox: () => Promise<T | null>,
   cursorX: number,
   cursorY: number,
   cfg: HumanConfig,
-): Promise<{ box: ElementBounds; cursorX: number; cursorY: number; didScroll: boolean }> {
-  const viewport = page.viewportSize();
-  if (!viewport) throw new Error('Viewport size not available');
+): Promise<{ box: T; cursorX: number; cursorY: number; didScroll: boolean }> {
+  let viewport = page.viewportSize();
+  if (!viewport) {
+    const world = getWorld(page);
+    if (!world) throw new StealthWorldUnavailableError();
+    try {
+      viewport = await world.evaluate(VIEWPORT_JS);
+    } catch {
+      throw new StealthEvaluationError('<viewport>');
+    }
+  }
+  if (!viewport || !viewport.height) throw new Error('Viewport size not available');
 
   let box = await getBox();
   if (!box) throw new Error('Element not found while scrolling into view');
@@ -63,7 +101,16 @@ export async function humanScrollIntoView(
     return { box, cursorX, cursorY, didScroll: false };
   }
 
-  // Move cursor into scroll area
+  const fullyVisible = box.y >= 0 && box.y + box.height <= viewport.height;
+  if (fullyVisible) {
+    const zoneMid = viewport.height * (cfg.scroll_target_zone[0] + cfg.scroll_target_zone[1]) / 2;
+    const needUp = box.y + box.height / 2 < zoneMid;
+    const { y, maxY } = await readScrollState(page);
+    if (needUp ? y <= 0 : y >= maxY) {
+      return { box, cursorX, cursorY, didScroll: false };
+    }
+  }
+
   const scrollAreaX = Math.round(viewport.width * rand(0.3, 0.7));
   const scrollAreaY = Math.round(viewport.height * rand(0.3, 0.7));
   await humanMove(raw, cursorX, cursorY, scrollAreaX, scrollAreaY, cfg);
@@ -71,7 +118,6 @@ export async function humanScrollIntoView(
   cursorY = scrollAreaY;
   await sleep(randRange(cfg.scroll_pre_move_delay));
 
-  // Calculate scroll distance
   const targetY = viewport.height * rand(cfg.scroll_target_zone[0], cfg.scroll_target_zone[1]);
   const elementCenter = box.y + box.height / 2;
   const distanceToScroll = elementCenter - targetY;
@@ -82,10 +128,8 @@ export async function humanScrollIntoView(
   const totalClicks = Math.max(3, Math.ceil(absDistance / avgDelta));
   const accelSteps = randIntRange(cfg.scroll_accel_steps);
   const decelSteps = randIntRange(cfg.scroll_decel_steps);
-
   let scrolled = 0;
 
-  // Scroll loop: accelerate → cruise → decelerate
   for (let i = 0; i < totalClicks; i++) {
     let delta: number;
     let pause: number;
@@ -108,18 +152,14 @@ export async function humanScrollIntoView(
     scrolled += Math.abs(delta);
     await sleep(pause);
 
-    // Check visibility every 3 steps
     if (i % 3 === 2 || i === totalClicks - 1) {
-      box = await getBox();
-      if (box && isInViewport(box, viewport.height, cfg)) {
-        break;
-      }
+      const nextBox = await getBox();
+      if (nextBox) box = nextBox;
+      if (nextBox && isInViewport(nextBox, viewport.height, cfg)) break;
     }
-
     if (scrolled >= absDistance * 1.1) break;
   }
 
-  // Optional overshoot + correction
   if (Math.random() < cfg.scroll_overshoot_chance) {
     const overshootPx = Math.round(randRange(cfg.scroll_overshoot_px)) * direction;
     await smoothWheel(raw, overshootPx, cfg);
@@ -133,24 +173,13 @@ export async function humanScrollIntoView(
     }
   }
 
-  // Settle
   await sleep(randRange(cfg.scroll_settle_delay));
 
-  box = await getBox();
-  if (!box) throw new Error('Element lost after scrolling into view');
-
-  return { box, cursorX, cursorY, didScroll: true };
+  const finalBox = await getBox();
+  if (!finalBox) throw new Error('Element lost after scrolling into view');
+  return { box: finalBox, cursorX, cursorY, didScroll: true };
 }
 
-/**
- * Selector-based humanized scroll.
- *
- * ``timeout`` is forwarded to Playwright's ``boundingBox({ timeout })`` so
- * callers like ``page.click('#x', { timeout: 5000 })`` can wait longer for
- * slow-loading elements (#172). Default matches Playwright's 30000ms when not specified.
- *
- * Returns `{ box, cursorX, cursorY, didScroll }`.
- */
 export async function scrollToElement(
   page: Page,
   raw: RawMouse,
@@ -158,25 +187,41 @@ export async function scrollToElement(
   cursorX: number,
   cursorY: number,
   cfg: HumanConfig,
-  timeout?: number,
-): Promise<{ box: ElementBounds; cursorX: number; cursorY: number; didScroll: boolean }> {
+  timeout: number = 30000,
+): Promise<{ box: SelectorBounds; cursorX: number; cursorY: number; didScroll: boolean }> {
   return humanScrollIntoView(
-    page, raw,
+    page,
+    raw,
     () => getElementBox(page, selector, timeout),
-    cursorX, cursorY, cfg,
+    cursorX,
+    cursorY,
+    cfg,
   );
 }
 
-async function getElementBox(
+export async function getElementBox(
   page: Page,
   selector: string,
   timeout: number = 30000,
-): Promise<ElementBounds | null> {
-  const el = page.locator(selector).first();
-  try {
-    const box = await el.boundingBox({ timeout: Math.max(1, timeout) });
-    return box;
-  } catch {
-    return null;
+): Promise<SelectorBounds | null> {
+  const world = getWorld(page);
+  if (!world) throw new StealthWorldUnavailableError();
+
+  const deadline = Date.now() + Math.max(0, timeout);
+  let result = await evalParsed(world, buildBoxJs(selector));
+  while (
+    (result.status === NOT_FOUND || result.status === EVALUATION_FAILED) &&
+    Date.now() < deadline
+  ) {
+    await sleep(50);
+    result = await evalParsed(world, buildBoxJs(selector));
   }
+
+  const { status, data } = result;
+  if (status === OK && data?.box && Number.isInteger(data.targetId) && Number.isInteger(data.gen)) {
+    return { ...data.box, targetId: data.targetId, gen: data.gen };
+  }
+  if (status === NOT_FOUND) return null;
+  if (status === UNSUPPORTED) throw new UnsupportedHumanizeSelectorError(selector);
+  throw new StealthEvaluationError(selector);
 }

@@ -8,6 +8,10 @@ import {
   getBinaryDir,
   getDownloadUrl,
   getFallbackDownloadUrl,
+  normalizeReleaseChannel,
+  normalizeRequestedVersion,
+  binarySupportsHeadlessNoViewport,
+  binarySupportsMaximizedWindow,
 } from "../src/config.js";
 import { _buildArgsForTest, resolveTimezone } from "../src/playwright.js";
 
@@ -52,8 +56,16 @@ describe("config", () => {
   });
 
   it("getCacheDir returns ~/.cloakbrowser by default", () => {
-    const dir = getCacheDir();
-    expect(dir).toContain(".cloakbrowser");
+    // tests/setup.ts points the cache dir at a temp dir for isolation; drop it
+    // here to exercise the real default.
+    const prev = process.env.CLOAKBROWSER_CACHE_DIR;
+    delete process.env.CLOAKBROWSER_CACHE_DIR;
+    try {
+      expect(getCacheDir()).toContain(".cloakbrowser");
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_CACHE_DIR;
+      else process.env.CLOAKBROWSER_CACHE_DIR = prev;
+    }
   });
 
   it("getBinaryDir includes platform version", () => {
@@ -67,6 +79,68 @@ describe("config", () => {
     expect(url).toContain("cloakbrowser-");
     expect(url).toContain(".tar.gz");
     expect(url).toContain("cloakbrowser.dev");
+  });
+});
+
+describe("release channel", () => {
+  it("defaults to stable", () => {
+    delete process.env.CLOAKBROWSER_RELEASE_CHANNEL;
+    expect(normalizeReleaseChannel()).toBe("stable");
+  });
+
+  it("normalizes preview case and whitespace", () => {
+    expect(normalizeReleaseChannel(" PREVIEW ")).toBe("preview");
+  });
+
+  it("reads the environment at call time", () => {
+    process.env.CLOAKBROWSER_RELEASE_CHANNEL = "preview";
+    try {
+      expect(normalizeReleaseChannel()).toBe("preview");
+    } finally {
+      delete process.env.CLOAKBROWSER_RELEASE_CHANNEL;
+    }
+  });
+
+  it("explicit stable overrides a preview environment", () => {
+    process.env.CLOAKBROWSER_RELEASE_CHANNEL = "preview";
+    try {
+      expect(normalizeReleaseChannel("stable")).toBe("stable");
+      expect(normalizeReleaseChannel("unknown")).toBe("stable");
+    } finally {
+      delete process.env.CLOAKBROWSER_RELEASE_CHANNEL;
+    }
+  });
+});
+
+describe("version pin", () => {
+  it("explicit value wins over env", () => {
+    process.env.CLOAKBROWSER_VERSION = "146.0.0.0";
+    try {
+      expect(normalizeRequestedVersion("148.0.7778.215.2")).toBe("148.0.7778.215.2");
+    } finally {
+      delete process.env.CLOAKBROWSER_VERSION;
+    }
+  });
+
+  it("reads CLOAKBROWSER_VERSION", () => {
+    process.env.CLOAKBROWSER_VERSION = "148.0.7778.215.2";
+    try {
+      expect(normalizeRequestedVersion()).toBe("148.0.7778.215.2");
+    } finally {
+      delete process.env.CLOAKBROWSER_VERSION;
+    }
+  });
+
+  it("rejects unsafe values", () => {
+    expect(() => normalizeRequestedVersion("../../148.0.7778.215.2")).toThrow(
+      "Invalid browser version pin"
+    );
+  });
+
+  it("rejects non-ASCII digits (parity with Python/.NET)", () => {
+    expect(() => normalizeRequestedVersion("١٤٦.0.7680.177")).toThrow(
+      "Invalid browser version pin"
+    );
   });
 });
 
@@ -197,7 +271,7 @@ describe("buildArgs webrtc IP", () => {
 
 describe("resolveTimezone alias", () => {
   it("resolves timezoneId to timezone", () => {
-    const result = resolveTimezone({ timezoneId: "Europe/Paris" });
+    const result = resolveTimezone({ timezoneId: "Europe/Paris" }) as unknown as { timezone: string };
     expect(result.timezone).toBe("Europe/Paris");
     expect(result).not.toHaveProperty("timezoneId");
   });
@@ -219,5 +293,96 @@ describe("resolveTimezone alias", () => {
     const opts = {};
     const result = resolveTimezone(opts);
     expect(result).toBe(opts);
+  });
+});
+
+describe("binarySupportsHeadlessNoViewport", () => {
+  // Parity-critical: Python and .NET mirror this gate. Threshold is an unshipped
+  // version, so the resolved-version path is a no-op today; the declared-version
+  // path is what these tests pin.
+  it("is OFF one build below the threshold (current live Pro version)", () => {
+    expect(binarySupportsHeadlessNoViewport(undefined, "148.0.7778.215.3")).toBe(false);
+  });
+
+  it("is ON at the threshold", () => {
+    expect(binarySupportsHeadlessNoViewport(undefined, "148.0.7778.215.4")).toBe(true);
+  });
+
+  it("is ON above the threshold", () => {
+    expect(binarySupportsHeadlessNoViewport(undefined, "149.0.0.0")).toBe(true);
+  });
+
+  it("declared version wins over a local override", () => {
+    const prev = process.env.CLOAKBROWSER_BINARY_PATH;
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+    try {
+      expect(binarySupportsHeadlessNoViewport(undefined, "149.0.0.0")).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_BINARY_PATH;
+      else process.env.CLOAKBROWSER_BINARY_PATH = prev;
+    }
+  });
+
+  it("is OFF for a local override with no declared version", () => {
+    const prev = process.env.CLOAKBROWSER_BINARY_PATH;
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+    try {
+      expect(binarySupportsHeadlessNoViewport()).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_BINARY_PATH;
+      else process.env.CLOAKBROWSER_BINARY_PATH = prev;
+    }
+  });
+
+  it("fails OFF on a malformed declared version", () => {
+    // parseVersion yields NaN rather than throwing — the gate must still fail safe.
+    expect(binarySupportsHeadlessNoViewport(undefined, "not.a.version")).toBe(false);
+  });
+});
+
+describe("binarySupportsMaximizedWindow", () => {
+  // Parity-critical: Python and .NET mirror this gate. Shares the no_viewport
+  // threshold today.
+  it("is OFF one build below the threshold", () => {
+    expect(binarySupportsMaximizedWindow(undefined, "148.0.7778.215.3")).toBe(false);
+  });
+  it("is ON at the threshold", () => {
+    expect(binarySupportsMaximizedWindow(undefined, "148.0.7778.215.4")).toBe(true);
+  });
+  it("is ON above the threshold", () => {
+    expect(binarySupportsMaximizedWindow(undefined, "149.0.0.0")).toBe(true);
+  });
+});
+
+describe("buildArgs --start-maximized", () => {
+  it("adds --start-maximized when the binary is gated ON", () => {
+    const args = _buildArgsForTest({ browserVersion: "148.0.7778.215.4" });
+    expect(args).toContain("--start-maximized");
+  });
+  it("does not add it below the gate", () => {
+    const args = _buildArgsForTest({ browserVersion: "148.0.7778.215.3" });
+    expect(args).not.toContain("--start-maximized");
+  });
+  it("is suppressed by a user --window-size", () => {
+    const args = _buildArgsForTest({
+      browserVersion: "148.0.7778.215.4",
+      args: ["--window-size=1000,800"],
+    });
+    expect(args).not.toContain("--start-maximized");
+    expect(args).toContain("--window-size=1000,800");
+  });
+  it("is suppressed by an explicit viewport", () => {
+    const args = _buildArgsForTest({
+      browserVersion: "148.0.7778.215.4",
+      viewport: { width: 800, height: 600 },
+    } as Parameters<typeof _buildArgsForTest>[0]);
+    expect(args).not.toContain("--start-maximized");
+  });
+  it("does not double a user-supplied --start-maximized", () => {
+    const args = _buildArgsForTest({
+      browserVersion: "148.0.7778.215.4",
+      args: ["--start-maximized"],
+    });
+    expect(args.filter(a => a === "--start-maximized")).toHaveLength(1);
   });
 });

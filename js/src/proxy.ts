@@ -2,7 +2,7 @@
  * Shared proxy URL parsing for Playwright and Puppeteer wrappers.
  */
 
-import { getChromiumVersion, getPlatformTag, parseVersion } from "./config.js";
+import { binarySupportsHttpProxyInlineAuth } from "./config.js";
 
 export interface ParsedProxy {
   server: string;
@@ -21,9 +21,9 @@ export function ensureProxyScheme(proxyUrl: string): string {
 /**
  * Parse a proxy URL, extracting credentials into separate fields.
  *
- * Handles: "http://user:pass@host:port" -> { server: "http://host:port", username: "user", password: "pass" }
- * Also handles: no credentials, URL-encoded special chars, socks5://, missing port,
- * and bare proxy strings without a scheme (e.g. "user:pass@host:port" -> treated as http).
+ * Handles authenticated proxy URLs by extracting credentials into separate
+ * fields. Also handles: no credentials, URL-encoded special chars, socks5://,
+ * missing port, and bare proxy strings without a scheme.
  */
 /** Proxy dict shape accepted by Playwright/Puppeteer wrappers. */
 export type ProxyDict = { server: string; bypass?: string; username?: string; password?: string };
@@ -74,7 +74,7 @@ function assembleSocksUrl(
  * bare ``%`` not followed by two hex digits is left as a literal ``%``.
  */
 function lenientDecodeURIComponent(s: string): string {
-  return s.replace(/%([0-9A-Fa-f]{2})|%/g, (match, hex) =>
+  return s.replace(/%([0-9A-Fa-f]{2})|%/g, (_match, hex) =>
     hex ? String.fromCharCode(parseInt(hex, 16)) : "%",
   );
 }
@@ -154,25 +154,6 @@ export function normalizeSocksStringUrl(urlStr: string): string {
   } catch (e) {
     console.warn(`[cloakbrowser] Could not normalize SOCKS5 proxy URL, passing through unchanged: ${(e as Error).message}`);
     return urlStr;
-  }
-}
-
-const HTTP_PROXY_INLINE_AUTH_MIN_VERSION = "146.0.7680.177.5";
-const HTTP_PROXY_INLINE_AUTH_PLATFORMS = new Set(["linux-x64", "windows-x64"]);
-
-export function supportsHttpProxyInlineAuth(): boolean {
-  try {
-    const tag = getPlatformTag();
-    if (!HTTP_PROXY_INLINE_AUTH_PLATFORMS.has(tag)) return false;
-    const current = parseVersion(getChromiumVersion());
-    const minimum = parseVersion(HTTP_PROXY_INLINE_AUTH_MIN_VERSION);
-    for (let i = 0; i < Math.max(current.length, minimum.length); i++) {
-      if ((current[i] ?? 0) > (minimum[i] ?? 0)) return true;
-      if ((current[i] ?? 0) < (minimum[i] ?? 0)) return false;
-    }
-    return true; // equal = supported
-  } catch {
-    return false;
   }
 }
 
@@ -258,7 +239,12 @@ export function normalizeHttpStringUrl(urlStr: string): string {
  * passed via Chrome's --proxy-server flag with inline credentials, bypassing
  * Playwright's CDP auth interceptor which breaks on some proxies (#182).
  */
-export function resolveProxyConfig(proxy: string | ProxyDict | undefined): ProxyConfig {
+export function resolveProxyConfig(
+  proxy: string | ProxyDict | undefined,
+  browserVersion?: string,
+  licenseKey?: string,
+  releaseChannel?: string,
+): ProxyConfig {
   if (!proxy) return { proxyArgs: [] };
 
   if (isSocksProxy(proxy)) {
@@ -274,9 +260,14 @@ export function resolveProxyConfig(proxy: string | ProxyDict | undefined): Proxy
     return { proxyArgs: args };
   }
 
-  // HTTP/HTTPS with credentials on supported platforms: bypass Playwright's
-  // CDP auth interceptor, use Chrome's preemptive Proxy-Authorization (#182).
-  if (hasCredentials(proxy) && supportsHttpProxyInlineAuth()) {
+  // HTTP/HTTPS with credentials, only on binaries that ship inline proxy auth:
+  // use Chrome's native proxy authentication path instead of Playwright's CDP
+  // auth interceptor (#182). Older binaries (free macOS/linux-arm64) can't parse
+  // inline credentials, so they fall through to the Playwright proxy dict below.
+  if (
+    hasCredentials(proxy) &&
+    binarySupportsHttpProxyInlineAuth(licenseKey, browserVersion, releaseChannel)
+  ) {
     if (typeof proxy === "string") {
       return { proxyArgs: [`--proxy-server=${normalizeHttpStringUrl(proxy)}`] };
     }

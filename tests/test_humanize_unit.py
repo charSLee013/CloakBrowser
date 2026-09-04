@@ -16,6 +16,8 @@ import asyncio
 import pytest
 from unittest.mock import MagicMock
 
+from cloakbrowser.human.stealth_dom import PROTOCOL_VERSION
+
 
 def _mock_el_evaluate(is_input=False):
     """Mock evaluate that returns is_input for tagName checks and {hit: True} for pointer events."""
@@ -191,10 +193,9 @@ class TestBezierMath:
 
 class TestAsyncCompat:
     def test_async_modules_import(self):
-        from cloakbrowser.human.mouse_async import AsyncRawMouse, async_human_move
-        from cloakbrowser.human.keyboard_async import AsyncRawKeyboard, async_human_type
+        from cloakbrowser.human.mouse_async import async_human_move
+        from cloakbrowser.human.keyboard_async import async_human_type
         from cloakbrowser.human.scroll_async import async_scroll_to_element
-        from cloakbrowser.human import patch_page_async, patch_browser_async, patch_context_async
         assert callable(async_human_move)
         assert callable(async_human_type)
         assert callable(async_scroll_to_element)
@@ -285,9 +286,11 @@ class TestFocusCheck:
             loc.page = page
             loc._impl_obj = MagicMock()
             loc._impl_obj._selector = "#test"
-            Locator.press(loc, "Enter")
+            loc._impl_obj._frame = None
+            Locator.press(loc, "Enter", delay=300)
 
         page.click.assert_not_called()
+        page.keyboard.press.assert_called_once_with("Enter", delay=300)
 
     def test_press_clicks_when_not_focused(self):
         _ensure_locator_patched()
@@ -308,6 +311,184 @@ class TestFocusCheck:
         page.click.assert_called_with("#test")
 
 
+class TestPressDelayForwarding:
+    @pytest.mark.asyncio
+    async def test_async_locator_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from playwright.async_api._generated import Locator as AsyncLocator
+        from unittest.mock import AsyncMock, patch
+
+        h._locator_async_patched = False
+        h._patch_locator_class_async()
+
+        page = MagicMock()
+        page._original = MagicMock()
+        page._human_cfg = MagicMock()
+        page._human_cfg.idle_between_actions = False
+        page.keyboard.press = AsyncMock()
+        locator = MagicMock()
+        locator.page = page
+        locator._impl_obj = MagicMock()
+        locator._impl_obj._selector = "#field"
+        locator._impl_obj._frame = None
+
+        with patch.object(h, "_async_is_selector_focused", new=AsyncMock(return_value=True)), \
+             patch.object(h, "async_sleep_ms", new=AsyncMock()):
+            await AsyncLocator.press(locator, "Control+V", delay=300)
+
+        page.keyboard.press.assert_awaited_once_with("Control+V", delay=300)
+
+    @staticmethod
+    def _config_and_cursor():
+        from cloakbrowser.human import _CursorState
+        from cloakbrowser.human.config import resolve_config
+
+        cfg = resolve_config("default", {"idle_between_actions": False})
+        cursor = _CursorState()
+        cursor.initialized = True
+        return cfg, cursor
+
+    @staticmethod
+    def _sync_originals():
+        originals = MagicMock()
+        originals.keyboard_press = MagicMock()
+        return originals
+
+    @staticmethod
+    def _sync_frame(focused=True):
+        frame = MagicMock()
+        frame._human_patched = False
+        locator = MagicMock()
+        locator.first.evaluate = MagicMock(return_value=focused)
+        frame.locator.return_value = locator
+        return frame
+
+    def test_page_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import patch
+
+        cfg, cursor = self._config_and_cursor()
+        page = MagicMock()
+        page.mouse = MagicMock()
+        page.keyboard = MagicMock()
+        original_press = page.keyboard.press
+        page.context.new_cdp_session.side_effect = RuntimeError("no cdp")
+        page.main_frame = self._sync_frame()
+        page.main_frame.child_frames = []
+
+        with patch.object(h, "ensure_actionable"), \
+             patch.object(h, "_is_selector_focused", return_value=True), \
+             patch.object(h, "sleep_ms"):
+            h.patch_page(page, cfg, cursor)
+            page.press("#field", "Control+V", delay=300)
+
+        original_press.assert_called_once_with("Control+V", delay=300)
+
+    def test_frame_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import patch
+
+        cfg, cursor = self._config_and_cursor()
+        originals = self._sync_originals()
+        frame = self._sync_frame()
+        page = MagicMock()
+        page._stealth_world = None
+
+        with patch.object(h, "sleep_ms"):
+            h._patch_single_frame_sync(
+                frame, page, cfg, cursor, MagicMock(), MagicMock(), originals
+            )
+            frame.press("#field", "Control+V", delay=300)
+
+        originals.keyboard_press.assert_called_once_with("Control+V", delay=300)
+
+    def test_element_handle_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import patch
+
+        cfg, cursor = self._config_and_cursor()
+        originals = self._sync_originals()
+        element = MagicMock()
+        element._human_patched = False
+
+        with patch.object(h, "sleep_ms"):
+            h._patch_single_element_handle_sync(
+                element, MagicMock(), cfg, cursor, MagicMock(), MagicMock(),
+                originals, None, None,
+            )
+            element.press("Control+V", delay=300)
+
+        originals.keyboard_press.assert_called_once_with("Control+V", delay=300)
+
+    @pytest.mark.asyncio
+    async def test_async_page_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import AsyncMock, patch
+
+        cfg, cursor = self._config_and_cursor()
+        page = MagicMock()
+        page.mouse = MagicMock()
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        original_press = page.keyboard.press
+        page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("no cdp"))
+        page.main_frame = MagicMock()
+        page.main_frame._human_patched = True
+        page.main_frame.child_frames = []
+
+        with patch.object(h, "async_ensure_actionable", new=AsyncMock()), \
+             patch.object(h, "_async_is_selector_focused", new=AsyncMock(return_value=True)), \
+             patch.object(h, "async_sleep_ms", new=AsyncMock()):
+            h.patch_page_async(page, cfg, cursor)
+            await page.press("#field", "Control+V", delay=300)
+
+        original_press.assert_awaited_once_with("Control+V", delay=300)
+
+    @pytest.mark.asyncio
+    async def test_async_frame_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import AsyncMock, patch
+
+        cfg, cursor = self._config_and_cursor()
+        originals = MagicMock()
+        originals.keyboard_press = AsyncMock()
+        frame = MagicMock()
+        frame._human_patched = False
+        locator = MagicMock()
+        locator.first.evaluate = AsyncMock(return_value=True)
+        frame.locator.return_value = locator
+        page = MagicMock()
+        page._stealth_world = None
+
+        with patch.object(h, "async_sleep_ms", new=AsyncMock()):
+            h._patch_single_frame_async(
+                frame, page, cfg, cursor, MagicMock(), MagicMock(), originals
+            )
+            await frame.press("#field", "Control+V", delay=300)
+
+        originals.keyboard_press.assert_awaited_once_with("Control+V", delay=300)
+
+    @pytest.mark.asyncio
+    async def test_async_element_handle_press_forwards_delay(self):
+        import cloakbrowser.human as h
+        from unittest.mock import AsyncMock, patch
+
+        cfg, cursor = self._config_and_cursor()
+        originals = MagicMock()
+        originals.keyboard_press = AsyncMock()
+        element = MagicMock()
+        element._human_patched = False
+
+        with patch.object(h, "async_sleep_ms", new=AsyncMock()):
+            h._patch_single_element_handle_async(
+                element, MagicMock(), cfg, cursor, MagicMock(), MagicMock(),
+                originals, None, [None],
+            )
+            await element.press("Control+V", delay=300)
+
+        originals.keyboard_press.assert_awaited_once_with("Control+V", delay=300)
+
+
 # =========================================================================
 # 5. check/uncheck idle
 # =========================================================================
@@ -317,12 +498,13 @@ class TestCheckUncheckIdle:
         _ensure_locator_patched()
         from unittest.mock import MagicMock, patch as mock_patch
         from cloakbrowser.human.config import resolve_config
-        cfg = resolve_config("default", {"idle_between_actions": True, "idle_between_duration": [50, 100]})
+        cfg = resolve_config("default", {"idle_between_actions": True, "idle_between_duration": (50, 100)})
 
         page = MagicMock()
         page._original = MagicMock()
         page._original.mouse_move = MagicMock()
         page._human_cfg = cfg
+        page._stealth_world = _FakeWorld({"r": "ok", "checked": False})
 
         idle_called = {"n": 0}
         def fake_idle(*a, **kw):
@@ -344,12 +526,13 @@ class TestCheckUncheckIdle:
         _ensure_locator_patched()
         from unittest.mock import MagicMock, patch as mock_patch
         from cloakbrowser.human.config import resolve_config
-        cfg = resolve_config("default", {"idle_between_actions": True, "idle_between_duration": [50, 100]})
+        cfg = resolve_config("default", {"idle_between_actions": True, "idle_between_duration": (50, 100)})
 
         page = MagicMock()
         page._original = MagicMock()
         page._original.mouse_move = MagicMock()
         page._human_cfg = cfg
+        page._stealth_world = _FakeWorld({"r": "ok", "checked": True})
 
         idle_called = {"n": 0}
         def fake_idle(*a, **kw):
@@ -393,6 +576,250 @@ class TestFramePatching:
         for method in expected:
             fn = getattr(frame, method)
             assert not isinstance(fn, MagicMock), f"frame.{method} was not patched"
+
+    def test_sync_dynamically_attached_frame_patched_once(self):
+        from cloakbrowser.human import _patch_frames_sync, _CursorState
+        from cloakbrowser.human.config import resolve_config
+
+        page = MagicMock()
+        page._human_frame_listener_attached = False
+        page._original_main_frame = True
+        page._stealth_world = None
+        main_frame = MagicMock()
+        main_frame._human_patched = True
+        main_frame.child_frames = []
+        page.main_frame = main_frame
+
+        cfg = resolve_config("default", None)
+        raw_mouse = MagicMock()
+        raw_keyboard = MagicMock()
+        originals = MagicMock()
+        _patch_frames_sync(
+            page, cfg, _CursorState(), raw_mouse, raw_keyboard, originals,
+        )
+        _patch_frames_sync(
+            page, cfg, _CursorState(), raw_mouse, raw_keyboard, originals,
+        )
+
+        page.on.assert_called_once()
+        event_name, handler = page.on.call_args.args
+        assert event_name == "frameattached"
+
+        attached_frame = MagicMock()
+        attached_frame._human_patched = False
+        handler(attached_frame)
+        patched_click = attached_frame.click
+        handler(attached_frame)
+
+        assert attached_frame._human_patched is True
+        assert attached_frame.click is patched_click
+
+    def test_async_dynamically_attached_frame_patched_once(self):
+        from cloakbrowser.human import _patch_frames_async, _CursorState
+        from cloakbrowser.human.config import resolve_config
+
+        page = MagicMock()
+        page._human_frame_listener_attached = False
+        page._original_main_frame = True
+        page._stealth_world = None
+        page._cdp_session_holder = [None]
+        main_frame = MagicMock()
+        main_frame._human_patched = True
+        main_frame.child_frames = []
+        page.main_frame = main_frame
+
+        cfg = resolve_config("default", None)
+        raw_mouse = MagicMock()
+        raw_keyboard = MagicMock()
+        originals = MagicMock()
+        _patch_frames_async(
+            page, cfg, _CursorState(), raw_mouse, raw_keyboard, originals,
+        )
+        _patch_frames_async(
+            page, cfg, _CursorState(), raw_mouse, raw_keyboard, originals,
+        )
+
+        page.on.assert_called_once()
+        event_name, handler = page.on.call_args.args
+        assert event_name == "frameattached"
+
+        attached_frame = MagicMock()
+        attached_frame._human_patched = False
+        handler(attached_frame)
+        patched_click = attached_frame.click
+        handler(attached_frame)
+
+        assert attached_frame._human_patched is True
+        assert attached_frame.click is patched_click
+
+
+# =========================================================================
+# 6b. iframe humanize routing (#428)
+# =========================================================================
+
+def _make_frame_for_routing(is_input=False, box=None):
+    """A MagicMock frame whose locator resolves to a real bounding box."""
+    from cloakbrowser.human import _patch_single_frame_sync, _CursorState
+    from cloakbrowser.human.config import resolve_config
+    cfg = resolve_config("default", None)
+    cursor = _CursorState()
+    page = MagicMock()
+    page._original = MagicMock()
+    page._stealth_world = None          # skip CDP path
+    frame = MagicMock()
+    frame._human_patched = False
+    loc_first = frame.locator.return_value.first
+    loc_first.bounding_box.return_value = box if box is not None else {
+        "x": 10.0, "y": 10.0, "width": 40.0, "height": 20.0}
+    loc_first.evaluate.return_value = is_input
+    loc_first.is_checked.return_value = False
+    orig_click = frame.click                                   # capture pre-patch
+    _patch_single_frame_sync(frame, page, cfg, cursor, MagicMock(), MagicMock(), MagicMock())
+    return frame, page, orig_click
+
+
+class TestFrameHumanizedRouting:
+    def test_frame_click_resolves_in_frame_not_page(self):
+        from unittest.mock import patch as mock_patch
+        frame, page, _ = _make_frame_for_routing()
+        with mock_patch("cloakbrowser.human.human_move") as mv, \
+             mock_patch("cloakbrowser.human.human_click") as clk:
+            frame.click("#btn")
+        # resolved through the frame's own locator, moved + clicked the real mouse,
+        # and NEVER re-dispatched to page.click (the #428 bug)
+        frame.locator.assert_any_call("#btn")
+        assert mv.called and clk.called
+        page.click.assert_not_called()
+
+    def test_frame_click_falls_back_to_native_when_no_box(self):
+        from unittest.mock import patch as mock_patch
+        frame, page, orig_click = _make_frame_for_routing(box=False)  # bounding_box -> falsy
+        with mock_patch("cloakbrowser.human.human_move") as mv, \
+             mock_patch("cloakbrowser.human.human_click") as clk:
+            frame.click("#btn")
+        assert not mv.called and not clk.called
+        orig_click.assert_called_once()          # native frame.click used
+        page.click.assert_not_called()
+
+
+def _make_locator_for_routing(frame_kind):
+    """Build a MagicMock locator + page.frames for _route_target testing.
+
+    frame_kind: 'main' | 'patched_sub' | 'unpatched_sub'
+    Returns (loc, page, child_frame).
+    """
+    _ensure_locator_patched()
+    page = MagicMock()
+    page._original = MagicMock()
+    main = MagicMock()
+    child = MagicMock()
+    child._human_patched = (frame_kind == "patched_sub")
+    page.main_frame = main
+    page.frames = [main, child]
+    loc = MagicMock()
+    loc.page = page
+    loc._impl_obj._selector = "#btn"
+    if frame_kind == "main":
+        loc._impl_obj._frame = main._impl_obj
+    else:
+        loc._impl_obj._frame = child._impl_obj
+    return loc, page, child
+
+
+class TestLocatorSubframeRouting:
+    def test_subframe_locator_routes_to_owning_frame(self):
+        from playwright.sync_api._generated import Locator
+        loc, page, child = _make_locator_for_routing("patched_sub")
+        Locator.click(loc)
+        child.click.assert_called_once()
+        assert child.click.call_args[0][0] == "#btn"
+        page.click.assert_not_called()
+
+    def test_mainframe_locator_routes_to_page(self):
+        from playwright.sync_api._generated import Locator
+        loc, page, child = _make_locator_for_routing("main")
+        Locator.click(loc)
+        page.click.assert_called_once()
+        assert page.click.call_args[0][0] == "#btn"
+        child.click.assert_not_called()
+
+    def test_unpatched_subframe_falls_back_to_native(self):
+        from playwright.sync_api._generated import Locator
+        loc, page, child = _make_locator_for_routing("unpatched_sub")
+        # native Locator.click is invoked on the mock; neither humanized path runs
+        Locator.click(loc)
+        child.click.assert_not_called()
+        page.click.assert_not_called()
+
+
+class TestLocatorSubframeRoutingAsync:
+    @pytest.mark.asyncio
+    async def test_async_subframe_locator_routes_to_owning_frame(self):
+        import cloakbrowser.human as h
+        from unittest.mock import AsyncMock
+        h._locator_async_patched = False
+        h._patch_locator_class_async()
+        from playwright.async_api._generated import Locator as AsyncLocator
+
+        page = MagicMock()
+        page._original = MagicMock()
+        main = MagicMock()
+        child = MagicMock()
+        child._human_patched = True
+        child.click = AsyncMock()
+        page.main_frame = main
+        page.frames = [main, child]
+        loc = MagicMock()
+        loc.page = page
+        loc._impl_obj._selector = "#btn"
+        loc._impl_obj._frame = child._impl_obj
+
+        await AsyncLocator.click(loc)
+        child.click.assert_awaited_once()
+        assert child.click.call_args[0][0] == "#btn"
+
+
+class TestFrameClickArgContract:
+    """#428 guard: _frame_click must call human_click(raw, is_input, cfg) in order.
+    The routing tests mock human_click, so a swap would slip through."""
+
+    def test_frame_click_passes_is_input_bool_and_cfg(self):
+        from unittest.mock import patch as mock_patch
+        from cloakbrowser.human.config import HumanConfig
+        frame, page, _ = _make_frame_for_routing(is_input=False)  # button
+        with mock_patch("cloakbrowser.human.human_move"), \
+             mock_patch("cloakbrowser.human.human_click") as clk:
+            frame.click("#btn")
+        args = clk.call_args[0]
+        assert isinstance(args[1], bool) and args[1] is False   # is_input
+        assert isinstance(args[2], HumanConfig)                 # cfg
+
+    def test_frame_click_marks_is_input_true_for_input(self):
+        from unittest.mock import patch as mock_patch
+        frame, page, _ = _make_frame_for_routing(is_input=True)
+        with mock_patch("cloakbrowser.human.human_move"), \
+             mock_patch("cloakbrowser.human.human_click") as clk:
+            frame.click("#inp")
+        assert clk.call_args[0][1] is True
+
+
+class TestFrameFillFocus:
+    def test_frame_fill_clicks_before_typing(self):
+        from unittest.mock import patch as mock_patch
+        frame, page, _ = _make_frame_for_routing(is_input=True)
+        with mock_patch("cloakbrowser.human.human_move"), \
+             mock_patch("cloakbrowser.human.human_click"), \
+             mock_patch("cloakbrowser.human.human_type") as htype:
+            frame.fill("#inp", "hello")
+        assert htype.called and htype.call_args[0][2] == "hello"
+
+    def test_frame_fill_falls_back_when_type_raises(self):
+        from unittest.mock import patch as mock_patch
+        frame, page, _ = _make_frame_for_routing(is_input=True)
+        with mock_patch("cloakbrowser.human.human_move"), \
+             mock_patch("cloakbrowser.human.human_click"), \
+             mock_patch("cloakbrowser.human.human_type", side_effect=RuntimeError("boom")):
+            frame.fill("#inp", "hello")  # must not raise — native fallback
 
 
 # =========================================================================
@@ -648,6 +1075,161 @@ class TestBrowserFill:
         browser.close()
 
 
+# =========================================================================
+# 6c. iframe humanize end-to-end (#428) — real same-origin iframe over HTTP
+# =========================================================================
+
+import threading
+import http.server
+import socketserver
+import contextlib
+
+_IFRAME_PARENT = (
+    b"<html><body><h1>parent</h1>"
+    b"<iframe name='myframe' src='/child.html' width=400 height=250></iframe>"
+    b"</body></html>"
+)
+_IFRAME_CHILD = (
+    b"<html><body>"
+    b"<button id='btn' onclick=\"this.textContent='CLICKED'\">Click Me</button>"
+    b"<input id='inp'>"
+    b"</body></html>"
+)
+
+
+@contextlib.contextmanager
+def _iframe_server():
+    """Serve a parent page + same-origin child page with a button/input."""
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _IFRAME_CHILD if self.path.startswith("/child") else _IFRAME_PARENT
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.slow
+class TestBrowserIframeHumanize:
+    """Regression for #428: humanize=True must interact with elements inside
+    sub-frames instead of misrouting to the top document."""
+
+    def test_humanized_click_inside_iframe(self):
+        from cloakbrowser import launch
+        with _iframe_server() as url:
+            browser = launch(headless=True, humanize=True)
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle")
+                frame = page.frame(name="myframe")
+                assert frame is not None
+                # the #428 case: a Locator obtained from a sub-frame
+                frame.locator("#btn").click(timeout=5000)
+                assert frame.locator("#btn").text_content() == "CLICKED"
+            finally:
+                browser.close()
+
+    def test_humanized_fill_inside_iframe(self):
+        from cloakbrowser import launch
+        with _iframe_server() as url:
+            browser = launch(headless=True, humanize=True)
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle")
+                frame = page.frame(name="myframe")
+                frame.locator("#inp").fill("hello", timeout=5000)
+                assert frame.locator("#inp").input_value() == "hello"
+            finally:
+                browser.close()
+
+    def test_humanized_click_inside_dynamically_attached_iframe(self):
+        from cloakbrowser import launch
+        with _iframe_server() as url:
+            browser = launch(headless=True, humanize=True)
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle")
+                with page.expect_event("frameattached") as event:
+                    page.evaluate("""() => {
+                        const iframe = document.createElement('iframe');
+                        iframe.src = '/child.html';
+                        document.body.appendChild(iframe);
+                    }""")
+                frame = event.value
+                frame.wait_for_load_state("domcontentloaded")
+                assert getattr(frame, "_human_patched", False)
+                frame.click("#btn", timeout=5000)
+                assert frame.locator("#btn").text_content() == "CLICKED"
+            finally:
+                browser.close()
+
+    def test_native_control_click_inside_iframe(self):
+        """Control: humanize=False must also work (parity)."""
+        from cloakbrowser import launch
+        with _iframe_server() as url:
+            browser = launch(headless=True, humanize=False)
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle")
+                frame = page.frame(name="myframe")
+                frame.locator("#btn").click(timeout=5000)
+                assert frame.locator("#btn").text_content() == "CLICKED"
+            finally:
+                browser.close()
+
+
+@pytest.mark.slow
+class TestBrowserIframeHumanizeAsync:
+    @pytest.mark.asyncio
+    async def test_async_humanized_click_inside_iframe(self):
+        from cloakbrowser import launch_async
+        with _iframe_server() as url:
+            browser = await launch_async(headless=True, humanize=True)
+            try:
+                page = await browser.new_page()
+                await page.goto(url, wait_until="networkidle")
+                frame = page.frame(name="myframe")
+                assert frame is not None
+                await frame.locator("#btn").click(timeout=5000)
+                assert await frame.locator("#btn").text_content() == "CLICKED"
+            finally:
+                await browser.close()
+
+    @pytest.mark.asyncio
+    async def test_async_humanized_click_inside_dynamically_attached_iframe(self):
+        from cloakbrowser import launch_async
+        with _iframe_server() as url:
+            browser = await launch_async(headless=True, humanize=True)
+            try:
+                page = await browser.new_page()
+                await page.goto(url, wait_until="networkidle")
+                async with page.expect_event("frameattached") as event:
+                    await page.evaluate("""() => {
+                        const iframe = document.createElement('iframe');
+                        iframe.src = '/child.html';
+                        document.body.appendChild(iframe);
+                    }""")
+                frame = await event.value
+                await frame.wait_for_load_state("domcontentloaded")
+                assert getattr(frame, "_human_patched", False)
+                await frame.click("#btn", timeout=5000)
+                assert await frame.locator("#btn").text_content() == "CLICKED"
+            finally:
+                await browser.close()
+
+
 @pytest.mark.slow
 class TestBrowserPatching:
     def test_page_has_original(self):
@@ -708,7 +1290,7 @@ class TestBrowserBotDetection:
         time.sleep(0.3)
         page.locator('#password').fill('SecurePass!123')
         time.sleep(0.5)
-        page.locator('button[type="submit"]').click()
+        page.locator('#loginForm button[type="submit"]').click()
         time.sleep(5)
         body = page.locator('body').text_content()
         assert '"superHumanSpeed": true' not in body
@@ -725,7 +1307,7 @@ class TestBrowserBotDetection:
         t0 = time.time()
         page.locator('#email').fill('test@example.com')
         page.locator('#password').fill('MyPassword!99')
-        page.locator('button[type="submit"]').click()
+        page.locator('#loginForm button[type="submit"]').click()
         elapsed_ms = int((time.time() - t0) * 1000)
         time.sleep(3)
         assert elapsed_ms > 3000
@@ -923,7 +1505,7 @@ class TestElementHandlePatchingSync:
     def test_element_handle_fill_clears_and_types(self):
         from cloakbrowser.human import _patch_single_element_handle_sync, _CursorState
         from cloakbrowser.human.config import resolve_config
-        from unittest.mock import MagicMock, call
+        from unittest.mock import MagicMock
 
         cfg = resolve_config("default", {"idle_between_actions": False, "mistype_chance": 0})
         cursor = _CursorState()
@@ -1034,7 +1616,7 @@ class TestElementHandlePatchingSync:
         assert result._human_patched is True
 
     def test_page_query_selector_patched(self):
-        from cloakbrowser.human import _patch_page_element_handles_sync, _patch_single_element_handle_sync, _CursorState
+        from cloakbrowser.human import _patch_page_element_handles_sync, _CursorState
         from cloakbrowser.human.config import resolve_config
         from unittest.mock import MagicMock
 
@@ -1376,53 +1958,23 @@ class TestAsyncElementHandle:
 # =========================================================================
 
 class TestPerCallTimeoutForwarding:
-    """page.click('#x', timeout=5000) must forward 5000 to bounding_box(),
-    not silently use the hardcoded 2000ms in scroll."""
-
-    def test_get_element_box_default_timeout(self):
-        """Default timeout matches Playwright's 30000ms."""
-        from cloakbrowser.human.scroll import _get_element_box
-        from unittest.mock import MagicMock
-
-        page = MagicMock()
-        loc = MagicMock()
-        loc.bounding_box = MagicMock(return_value={"x": 0, "y": 0, "width": 1, "height": 1})
-        page.locator = MagicMock(return_value=MagicMock(first=loc))
-
-        _get_element_box(page, "#x")
-        loc.bounding_box.assert_called_once_with(timeout=30000)
-
-    def test_get_element_box_custom_timeout(self):
-        """Caller can pass a custom timeout that overrides the default."""
-        from cloakbrowser.human.scroll import _get_element_box
-        from unittest.mock import MagicMock
-
-        page = MagicMock()
-        loc = MagicMock()
-        loc.bounding_box = MagicMock(return_value={"x": 0, "y": 0, "width": 1, "height": 1})
-        page.locator = MagicMock(return_value=MagicMock(first=loc))
-
-        _get_element_box(page, "#x", timeout=5000)
-        loc.bounding_box.assert_called_once_with(timeout=5000)
+    """Per-call deadlines must reach isolated-world geometry polling."""
 
     def test_scroll_to_element_forwards_timeout(self):
-        """scroll_to_element passes timeout through to bounding_box()."""
-        from cloakbrowser.human.scroll import scroll_to_element
+        from cloakbrowser.human import scroll as scroll_module
         from cloakbrowser.human.config import resolve_config
-        from unittest.mock import MagicMock
+        from unittest.mock import MagicMock, patch
 
         cfg = resolve_config("default", None)
         page = MagicMock()
         page.viewport_size = {"width": 1280, "height": 720}
-        loc = MagicMock()
-        # Already in viewport so we don't actually scroll — just verify
-        # the timeout was forwarded on the first bounding_box() call.
-        loc.bounding_box = MagicMock(return_value={"x": 100, "y": 200, "width": 50, "height": 30})
-        page.locator = MagicMock(return_value=MagicMock(first=loc))
-
         raw = MagicMock()
-        scroll_to_element(page, raw, "#x", 0, 0, cfg, timeout=7500)
-        loc.bounding_box.assert_called_with(timeout=7500)
+        box = {"x": 100, "y": 200, "width": 50, "height": 30}
+
+        with patch.object(scroll_module, "_get_element_box", return_value=box) as get_box:
+            scroll_module.scroll_to_element(page, raw, "#x", 0, 0, cfg, timeout=7500)
+
+        get_box.assert_called_with(page, "#x", 7500)
 
     def test_page_click_forwards_timeout_kwarg(self):
         """page.click(selector, timeout=...) reaches scroll_to_element.
@@ -1467,7 +2019,9 @@ class TestPerCallTimeoutForwarding:
             return ({"x": 100, "y": 100, "width": 50, "height": 30}, cx, cy, False)
 
         with patch.object(h, "scroll_to_element", side_effect=fake_scroll), \
-             patch.object(h, "ensure_actionable"):
+             patch.object(h, "ensure_actionable"), \
+             patch.object(h, "_is_input_element", return_value=False), \
+             patch.object(h, "check_pointer_events"):
             h.patch_page(page, cfg, cursor)
             page.click("#slow-button", timeout=5000)
 
@@ -1559,6 +2113,7 @@ class TestPerCallHumanConfigOverride:
         with patch.object(h, "human_type", side_effect=fake_human_type), \
              patch.object(h, "scroll_to_element", side_effect=fake_scroll), \
              patch.object(h, "ensure_actionable"), \
+             patch.object(h, "_is_input_element", return_value=True), \
              patch.object(h, "check_pointer_events"):
             h.patch_page(page, cfg, cursor)
             page.type(
@@ -1609,6 +2164,7 @@ class TestPerCallHumanConfigOverride:
         with patch.object(h, "human_type", side_effect=fake_human_type), \
              patch.object(h, "scroll_to_element", side_effect=fake_scroll), \
              patch.object(h, "ensure_actionable"), \
+             patch.object(h, "_is_input_element", return_value=True), \
              patch.object(h, "check_pointer_events"):
             h.patch_page(page, cfg, cursor)
             page.fill("#password", "secret", human_config={"typing_delay": 150})
@@ -1817,7 +2373,7 @@ class TestScrollIntoViewIfNeeded:
             return ({"x": 100, "y": 100, "width": 50, "height": 30}, 200, 200, False)
 
         with patch.object(h, "human_scroll_into_view", side_effect=fake):
-            Locator.scroll_into_view_if_needed(
+            getattr(Locator, "scroll_into_view_if_needed")(
                 loc, human_config={"scroll_overshoot_chance": 0.5},
             )
 
@@ -1826,6 +2382,508 @@ class TestScrollIntoViewIfNeeded:
         assert called["cfg"].scroll_overshoot_chance == 0.5
         # Cursor was updated from the helper's return value
         assert cursor.x == 200 and cursor.y == 200
+
+
+# =========================================================================
+# Issue #307: frame/page click timeout should not multiply
+# =========================================================================
+
+class TestTimeoutBudget307:
+    """Verify timeout budget is shared across sequential operations."""
+
+    def test_page_click_total_time_within_budget(self):
+        """page.click on a missing element should not exceed ~1x the timeout."""
+        import cloakbrowser.human as h
+        from cloakbrowser.human import _CursorState
+        from cloakbrowser.human.config import resolve_config
+        from unittest.mock import MagicMock
+
+        TIMEOUT_MS = 500
+        cfg = resolve_config("default", {"idle_between_actions": False})
+        cursor = _CursorState()
+        cursor.initialized = True
+        cursor.x = 100
+        cursor.y = 100
+
+        page = MagicMock()
+        page.click = MagicMock()
+        page.dblclick = MagicMock()
+        page.hover = MagicMock()
+        page.type = MagicMock()
+        page.fill = MagicMock()
+        page.goto = MagicMock()
+        page.is_checked = MagicMock(return_value=False)
+        page.viewport_size = {"width": 1280, "height": 720}
+        page.evaluate = MagicMock(return_value={"hit": True})
+        page.context.new_cdp_session = MagicMock(side_effect=Exception("no cdp"))
+        page.mouse = MagicMock()
+        page.keyboard = MagicMock()
+        page.query_selector = MagicMock(return_value=None)
+        page.query_selector_all = MagicMock(return_value=[])
+        page.wait_for_selector = MagicMock(return_value=None)
+        page.main_frame = MagicMock()
+        page.main_frame.child_frames = []
+
+        loc = MagicMock()
+        loc.wait_for = MagicMock(side_effect=lambda **kw: time.sleep(kw.get("timeout", 30000) / 1000.0))
+        loc.is_visible = MagicMock(return_value=False)
+        loc.first = loc
+        page.locator = MagicMock(return_value=loc)
+
+        h.patch_page(page, cfg, cursor)
+
+        start = time.monotonic()
+        try:
+            page.click("#does-not-exist", timeout=TIMEOUT_MS)
+        except Exception:
+            pass
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        assert elapsed_ms < TIMEOUT_MS * 1.8, (
+            f"expected <{TIMEOUT_MS * 1.8}ms, got {elapsed_ms:.0f}ms"
+        )
+
+
+class TestPointerEventsFailurePolicy:
+    """Legacy handles fail open; selector paths in the stealth world fail closed."""
+
+    def test_handle_failopen_returns_on_evaluate_error(self):
+        from cloakbrowser.human.actionability import check_pointer_events_handle
+        el = MagicMock()
+        el.bounding_box = MagicMock(side_effect=Exception("stale handle"))
+        el.evaluate = MagicMock(side_effect=Exception("execution context destroyed"))
+        start = time.monotonic()
+        check_pointer_events_handle(MagicMock(), el, 100, 100, timeout=2000)  # must not raise
+        elapsed_ms = (time.monotonic() - start) * 1000
+        assert elapsed_ms < 500, f"fail-open should return promptly, took {elapsed_ms:.0f}ms"
+
+    def test_selector_evaluation_error_fails_closed_without_playwright(self):
+        from cloakbrowser.human.actionability import check_pointer_events
+        from cloakbrowser.human.stealth_dom import StealthEvaluationError
+        page = _no_locator_page(_FakeWorld(None))
+        start = time.monotonic()
+        with pytest.raises(StealthEvaluationError):
+            check_pointer_events(page, "#x", 1, 1, 100, 100, timeout=1)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        assert elapsed_ms < 500
+
+    def test_handle_still_raises_when_covered(self):
+        """A genuine 'covered' result (not None) must still raise — fail-open
+        only applies when the check could not be determined."""
+        from cloakbrowser.human.actionability import (
+            check_pointer_events_handle, ElementNotReceivingEventsError,
+        )
+        el = MagicMock()
+        el.bounding_box = MagicMock(return_value={"x": 0, "y": 0, "width": 10, "height": 10})
+        el.evaluate = MagicMock(return_value={"hit": False, "covering": "DIV"})
+        with pytest.raises(ElementNotReceivingEventsError):
+            check_pointer_events_handle(MagicMock(), el, 5, 5, timeout=200)
+
+    def test_async_handle_failopen_returns_on_evaluate_error(self):
+        from cloakbrowser.human.actionability_async import async_check_pointer_events_handle
+        from unittest.mock import AsyncMock
+        el = MagicMock()
+        el.bounding_box = AsyncMock(side_effect=Exception("stale handle"))
+        el.evaluate = AsyncMock(side_effect=Exception("execution context destroyed"))
+        start = time.monotonic()
+        asyncio.run(async_check_pointer_events_handle(MagicMock(), el, 100, 100, timeout=2000))
+        elapsed_ms = (time.monotonic() - start) * 1000
+        assert elapsed_ms < 500, f"fail-open should return promptly, took {elapsed_ms:.0f}ms"
+
+
+# =========================================================================
+# Isolated-world DOM helper (stealth_dom) + rewired actionability/scroll
+# =========================================================================
+
+def _versioned_fake_payload(response):
+    if not isinstance(response, dict):
+        return response
+    payload = dict(response)
+    payload.setdefault("v", PROTOCOL_VERSION)
+    if payload.get("r") in ("ok", "stale"):
+        payload.setdefault("targetId", 1)
+        payload.setdefault("gen", 1)
+    return payload
+
+
+class _FakeWorld:
+    """Sync stand-in for page._stealth_world with protocol-valid payloads."""
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def evaluate(self, expr):
+        self.calls.append(expr)
+        response = self.response(expr) if callable(self.response) else self.response
+        return _versioned_fake_payload(response)
+
+
+class _AsyncFakeWorld:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    async def evaluate(self, expr):
+        self.calls.append(expr)
+        response = self.response(expr) if callable(self.response) else self.response
+        return _versioned_fake_payload(response)
+
+
+def _no_locator_page(world):
+    """A page whose .locator explodes — proves the isolated world handled the
+    read and Playwright was never touched (the whole point of the change)."""
+    page = MagicMock()
+    page._stealth_world = world
+    page.locator = MagicMock(side_effect=AssertionError("Playwright locator must not be used when the isolated world handles the read"))
+    return page
+
+
+class TestStealthDomBuilders:
+    def test_box_js_escapes_selector(self):
+        from cloakbrowser.human.stealth_dom import build_box_js
+        js = build_box_js('a"b')
+        assert '"a\\"b"' in js
+        assert "getBoundingClientRect" in js
+
+    def test_actionable_js_reads_visibility(self):
+        from cloakbrowser.human.stealth_dom import build_actionable_js
+        js = build_actionable_js("#x")
+        assert '"#x"' in js
+        assert "visible" in js and "getComputedStyle" in js
+
+    def test_snapshot_js_uses_versioned_identity_protocol(self):
+        from cloakbrowser.human.stealth_dom import build_snapshot_js
+        js = build_snapshot_js("#x")
+        assert "v: __V" in js
+        assert "targetId: __targetId(__el)" in js
+        assert "Object.defineProperty(globalThis" in js
+
+    def test_validate_js_requires_same_target_at_point(self):
+        from cloakbrowser.human.stealth_dom import build_validate_js
+        js = build_validate_js("#x", 7, 3, 1.5, 2.5)
+        assert "__id !== 7" in js
+        assert "r: 'stale'" in js
+        assert "__deepElementFromPoint(1.5, 2.5)" in js
+
+    def test_pointer_js_inlines_coords(self):
+        from cloakbrowser.human.stealth_dom import build_pointer_js
+        js = build_pointer_js("#x", 1.5, 2.5)
+        assert "__deepElementFromPoint(1.5, 2.5)" in js
+
+    def test_parse_result(self):
+        from cloakbrowser.human.stealth_dom import (
+            parse_result, EVALUATION_FAILED, NOT_FOUND, OK, STALE, UNSUPPORTED,
+        )
+        ok = {"v": 2, "r": "ok", "targetId": 4, "gen": 3, "box": {"x": 1}}
+        assert parse_result(ok) == (OK, ok)
+        assert parse_result({"v": 2, "r": "not_found"}) == (NOT_FOUND, None)
+        stale = {"v": 2, "r": "stale", "targetId": 9, "gen": 3}
+        assert parse_result(stale) == (STALE, stale)
+        assert parse_result({"v": 2, "r": "unsupported"}) == (UNSUPPORTED, None)
+        # A payload without the world generation cannot be trusted for identity.
+        assert parse_result({"v": 2, "r": "ok", "targetId": 4}) == (EVALUATION_FAILED, None)
+        assert parse_result({"v": 2, "r": "stale", "targetId": 4}) == (EVALUATION_FAILED, None)
+        # Malformed/empty evaluation results are explicit failures, never fallback signals.
+        assert parse_result(None) == (EVALUATION_FAILED, None)
+        assert parse_result("UNSUPPORTED") == (EVALUATION_FAILED, None)
+        assert parse_result([]) == (EVALUATION_FAILED, None)
+        assert parse_result({"v": 999, "r": "ok", "targetId": 1}) == (
+            EVALUATION_FAILED, None,
+        )
+        assert parse_result({"v": 1, "r": "ok"}) == (EVALUATION_FAILED, None)
+
+
+class TestEnsureActionableStealth:
+    def test_ok_returns_without_playwright(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK
+        world = _FakeWorld({"r": "ok", "visible": True, "enabled": True, "editable": True})
+        page = _no_locator_page(world)
+        ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100)
+        assert len(world.calls) == 1  # single in-world read, no locator fallback
+
+    def test_not_visible_raises(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK, ElementNotVisibleError
+        page = _no_locator_page(_FakeWorld({"r": "ok", "visible": False, "enabled": True, "editable": True}))
+        with pytest.raises(ElementNotVisibleError):
+            ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100)
+
+    def test_disabled_raises(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK, ElementNotEnabledError
+        page = _no_locator_page(_FakeWorld({"r": "ok", "visible": True, "enabled": False, "editable": True}))
+        with pytest.raises(ElementNotEnabledError):
+            ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100)
+
+    def test_not_found_raises_attached(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK, ElementNotAttachedError
+        page = _no_locator_page(_FakeWorld({"r": "not_found"}))
+        with pytest.raises(ElementNotAttachedError):
+            ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100)
+
+    def test_unsupported_raises_without_playwright(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK
+        from cloakbrowser.human.stealth_dom import UnsupportedHumanizeSelectorError
+        page = _no_locator_page(_FakeWorld({"r": "unsupported"}))
+        with pytest.raises(UnsupportedHumanizeSelectorError):
+            ensure_actionable(page, "internal:role=button", CHECKS_CLICK, timeout=100)
+
+    def test_no_world_raises_without_playwright(self):
+        from cloakbrowser.human.actionability import ensure_actionable, CHECKS_CLICK
+        from cloakbrowser.human.stealth_dom import StealthWorldUnavailableError
+        page = MagicMock()
+        page._stealth_world = None
+        page.locator = MagicMock(side_effect=AssertionError("must not call Playwright"))
+        with pytest.raises(StealthWorldUnavailableError):
+            ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100)
+        page.locator.assert_not_called()
+
+
+class TestSelectorSnapshotHelpers:
+    def test_input_and_focus_use_canonical_snapshot(self):
+        from cloakbrowser.human import _is_input_element, _is_selector_focused
+        world = _FakeWorld({
+            "r": "ok", "isInput": True, "focused": True,
+        })
+        page = _no_locator_page(world)
+        page.evaluate = MagicMock(side_effect=AssertionError("must stay isolated"))
+        assert _is_input_element(page, "text=Submit") is True
+        assert _is_selector_focused(page, "text=Submit") is True
+        page.evaluate.assert_not_called()
+
+    def test_unsupported_input_selector_raises(self):
+        from cloakbrowser.human import _is_input_element
+        from cloakbrowser.human.stealth_dom import UnsupportedHumanizeSelectorError
+        page = _no_locator_page(_FakeWorld({"r": "unsupported"}))
+        with pytest.raises(UnsupportedHumanizeSelectorError):
+            _is_input_element(page, "internal:role=button")
+
+    def test_async_input_and_focus_use_canonical_snapshot(self):
+        from cloakbrowser.human import (
+            _async_is_input_element, _async_is_selector_focused,
+        )
+        world = _AsyncFakeWorld({
+            "r": "ok", "isInput": True, "focused": False,
+        })
+        page = _no_locator_page(world)
+        assert asyncio.run(_async_is_input_element(page, "text=Submit")) is True
+        assert asyncio.run(_async_is_selector_focused(page, "text=Submit")) is False
+
+
+class TestGetElementBoxStealth:
+    def test_ok_returns_box_without_playwright(self):
+        from cloakbrowser.human.scroll import _get_element_box
+        box = {"x": 10.0, "y": 20.0, "width": 30.0, "height": 40.0}
+        page = _no_locator_page(_FakeWorld({"r": "ok", "targetId": 7, "gen": 3, "box": box}))
+        assert _get_element_box(page, "#x") == {**box, "targetId": 7, "gen": 3}
+
+    def test_not_found_returns_none_stays_in_world(self):
+        from cloakbrowser.human.scroll import _get_element_box
+        page = _no_locator_page(_FakeWorld({"r": "not_found"}))
+        assert _get_element_box(page, "#x", timeout=100) is None
+
+    def test_unsupported_raises_without_fallback(self):
+        from cloakbrowser.human.scroll import _get_element_box
+        from cloakbrowser.human.stealth_dom import UnsupportedHumanizeSelectorError
+        page = _no_locator_page(_FakeWorld({"r": "unsupported"}))
+        with pytest.raises(UnsupportedHumanizeSelectorError):
+            _get_element_box(page, "internal:role=button")
+
+    def test_custom_timeout_is_not_capped_at_two_seconds(self):
+        from cloakbrowser.human.scroll import _get_element_box
+        from unittest.mock import patch
+
+        responses = iter([
+            {"r": "not_found"},
+            {"r": "ok", "targetId": 3,
+             "box": {"x": 1, "y": 2, "width": 3, "height": 4}},
+        ])
+        page = _no_locator_page(_FakeWorld(lambda expr: next(responses)))
+        with patch("cloakbrowser.human.scroll.time") as mock_time:
+            mock_time.monotonic.side_effect = [0, 2.5]
+            box = _get_element_box(page, "#slow", timeout=5000)
+        assert box["targetId"] == 3
+
+    def test_async_custom_timeout_is_not_capped_at_two_seconds(self):
+        from cloakbrowser.human.scroll_async import _get_element_box_async
+        from unittest.mock import AsyncMock, patch
+
+        responses = iter([
+            {"r": "not_found"},
+            {"r": "ok", "targetId": 4,
+             "box": {"x": 1, "y": 2, "width": 3, "height": 4}},
+        ])
+        page = _no_locator_page(_AsyncFakeWorld(lambda expr: next(responses)))
+        with patch("cloakbrowser.human.scroll_async.time") as mock_time, patch(
+            "cloakbrowser.human.scroll_async.asyncio.sleep", new=AsyncMock()
+        ):
+            mock_time.monotonic.side_effect = [0, 2.5]
+            box = asyncio.run(_get_element_box_async(page, "#slow", timeout=5000))
+        assert box["targetId"] == 4
+
+
+class TestCheckPointerEventsStealth:
+    def test_hit_returns(self):
+        from cloakbrowser.human.actionability import check_pointer_events
+        world = _FakeWorld({"r": "ok", "hit": True})
+        page = _no_locator_page(world)
+        check_pointer_events(page, "#x", 1, 1, 5, 5, stealth=world, timeout=200)
+
+    def test_miss_raises(self):
+        from cloakbrowser.human.actionability import check_pointer_events, ElementNotReceivingEventsError
+        world = _FakeWorld({"r": "ok", "hit": False, "covering": "DIV"})
+        page = _no_locator_page(world)
+        with pytest.raises(ElementNotReceivingEventsError):
+            check_pointer_events(page, "#x", 1, 1, 5, 5, stealth=world, timeout=200)
+
+    def test_force_skips_the_check_entirely(self):
+        """force=True bypasses the pointer check, matching Playwright, where
+        force skips all actionability rather than only coverage rejection."""
+        from unittest.mock import patch
+
+        import cloakbrowser.human as h
+        from cloakbrowser.human.config import resolve_config
+
+        cfg = resolve_config("default")
+        cursor = h._CursorState()
+        cursor.initialized = True
+        cursor.x = 100
+        cursor.y = 100
+
+        page = MagicMock()
+        page.viewport_size = {"width": 1280, "height": 720}
+        page.context.new_cdp_session = MagicMock(side_effect=Exception("no cdp"))
+        page.main_frame = MagicMock()
+        page.main_frame.child_frames = []
+
+        def fake_scroll(page_arg, raw, selector, cx, cy, cfg_arg, timeout=30000):
+            return ({"x": 10, "y": 10, "width": 50, "height": 30, "targetId": 1}, cx, cy, False)
+
+        with patch.object(h, "scroll_to_element", side_effect=fake_scroll), \
+             patch.object(h, "ensure_actionable"), \
+             patch.object(h, "_is_input_element", return_value=False), \
+             patch.object(h, "check_pointer_events") as checked:
+            h.patch_page(page, cfg, cursor)
+            page.click("#x", force=True)
+            assert not checked.called, "force=True must not run the pointer check"
+
+            page.click("#x")
+            assert checked.called, "force=False must still run the pointer check"
+
+    def test_stale_target_raises(self):
+        from cloakbrowser.human.actionability import (
+            check_pointer_events, ElementTargetChangedError,
+        )
+        world = _FakeWorld({"r": "stale", "targetId": 2})
+        page = _no_locator_page(world)
+        with pytest.raises(ElementTargetChangedError):
+            check_pointer_events(page, "#x", 1, 1, 5, 5, stealth=world, timeout=200)
+
+    def test_unsupported_raises_without_fallback(self):
+        from cloakbrowser.human.actionability import check_pointer_events
+        from cloakbrowser.human.stealth_dom import UnsupportedHumanizeSelectorError
+        world = _FakeWorld({"r": "unsupported"})
+        page = _no_locator_page(world)
+        with pytest.raises(UnsupportedHumanizeSelectorError):
+            check_pointer_events(
+                page, "internal:role=button", 1, 1, 5, 5,
+                stealth=world, timeout=200,
+            )
+
+
+class TestStealthAsync:
+    def test_async_ensure_actionable_ok(self):
+        from cloakbrowser.human.actionability_async import async_ensure_actionable
+        from cloakbrowser.human.actionability import CHECKS_CLICK
+        world = _AsyncFakeWorld({"r": "ok", "visible": True, "enabled": True, "editable": True})
+        page = _no_locator_page(world)
+        asyncio.run(async_ensure_actionable(page, "#x", CHECKS_CLICK, timeout=100))
+        assert len(world.calls) == 1
+
+    def test_async_get_element_box_ok(self):
+        from cloakbrowser.human.scroll_async import _get_element_box_async
+        box = {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0}
+        page = _no_locator_page(_AsyncFakeWorld({"r": "ok", "targetId": 9, "gen": 3, "box": box}))
+        assert asyncio.run(_get_element_box_async(page, "#x")) == {**box, "targetId": 9, "gen": 3}
+
+
+# =========================================================================
+# framenavigated -> isolated-world invalidation (#507)
+# =========================================================================
+
+class TestFrameNavigatedInvalidation:
+    """Regression #507: click/form/history navigation must invalidate the
+    isolated world, not just page.goto. Without this the world stays bound to
+    a bfcached old document and fill()/click() actionability reads fail."""
+
+    @staticmethod
+    def _build_page(is_async):
+        from unittest.mock import MagicMock, AsyncMock
+        Mock = AsyncMock if is_async else MagicMock
+        page = MagicMock()
+        for name in ("click", "dblclick", "hover", "type", "fill", "goto",
+                     "check", "uncheck", "select_option", "press"):
+            setattr(page, name, Mock())
+        page.is_checked = Mock(return_value=False)
+        page.viewport_size = {"width": 1280, "height": 720}
+        page.evaluate = Mock(return_value={"hit": True})
+        # new_cdp_session must SUCCEED so the stealth world is created
+        page.context.new_cdp_session = Mock(return_value=MagicMock())
+        for surface in ("mouse", "keyboard"):
+            setattr(page, surface, MagicMock())
+        for m in ("move", "click", "wheel", "down", "up"):
+            setattr(page.mouse, m, Mock())
+        for m in ("type", "down", "up", "press", "insert_text"):
+            setattr(page.keyboard, m, Mock())
+        page.query_selector = Mock(return_value=None)
+        page.query_selector_all = Mock(return_value=[])
+        page.wait_for_selector = Mock(return_value=None)
+        # main_frame is a property in the Playwright API (sync + async)
+        main_frame = MagicMock()
+        main_frame.child_frames = []
+        page.main_frame = main_frame
+        return page
+
+    @staticmethod
+    def _framenavigated_handler(page):
+        # capture the handler registered via page.on("framenavigated", cb)
+        for call in page.on.call_args_list:
+            if call.args and call.args[0] == "framenavigated":
+                return call.args[1]
+        return None
+
+    def _run(self, is_async):
+        import cloakbrowser.human as h
+        from cloakbrowser.human import _CursorState
+        from cloakbrowser.human.config import resolve_config
+
+        cfg = resolve_config("default", {"idle_between_actions": False})
+        cursor = _CursorState()
+        cursor.initialized = True
+        cursor.x = cursor.y = 100
+        page = self._build_page(is_async)
+
+        (h.patch_page_async if is_async else h.patch_page)(page, cfg, cursor)
+
+        handler = self._framenavigated_handler(page)
+        assert handler is not None, "framenavigated listener was not registered"
+
+        world = page._stealth_world
+        assert world is not None
+
+        # main-frame navigation invalidates the world
+        world._context_id = 123
+        handler(page.main_frame)
+        assert world._context_id is None, "main-frame nav did not invalidate the world"
+
+        # a subframe navigation must NOT invalidate
+        world._context_id = 456
+        handler(MagicMock())  # some other frame
+        assert world._context_id == 456, "subframe nav wrongly invalidated the world"
+
+    def test_sync_invalidates_on_main_frame_nav(self):
+        self._run(is_async=False)
+
+    def test_async_invalidates_on_main_frame_nav(self):
+        self._run(is_async=True)
 
 
 # =========================================================================

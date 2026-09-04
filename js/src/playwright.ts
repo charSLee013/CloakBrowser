@@ -5,11 +5,24 @@
 
 import type { Browser, BrowserContext, BrowserContextOptions, LaunchOptions as PlaywrightLaunchOptions } from "playwright-core";
 import type { LaunchOptions, LaunchContextOptions, LaunchPersistentContextOptions } from "./types.js";
-import { DEFAULT_VIEWPORT, IGNORE_DEFAULT_ARGS } from "./config.js";
+import {
+  DEFAULT_VIEWPORT,
+  IGNORE_DEFAULT_ARGS,
+  binarySupportsHeadlessNoViewport,
+} from "./config.js";
 import { buildArgs } from "./args.js";
+import { maybeWarnWindowsFonts } from "./fonts.js";
 import { ensureBinary } from "./download.js";
 import { resolveProxyConfig } from "./proxy.js";
-import { maybeResolveGeoip, resolveWebrtcArgs } from "./geoip.js";
+import { maybeResolveGeoip, resolveWebrtcArgs, appendWebrtcExitIp } from "./geoip.js";
+import {
+  buildLaunchEnv,
+  installLicenseGuard,
+  licenseErrorFrom,
+  mintDenialFile,
+  resolveLicenseKey,
+} from "./license.js";
+import { seedWidevineHint } from "./widevine.js";
 
 /** @internal Accept both timezone and timezoneId — either works, no warning. Exported for testing. */
 export function resolveTimezone<T extends { timezone?: string; timezoneId?: string }>(options: T): T {
@@ -45,22 +58,96 @@ function filterStealthCtxOptions(ctx?: BrowserContextOptions): Partial<BrowserCo
 }
 
 /**
+ * Build Playwright BrowserContext options for CloakBrowser without launching a browser
+ * or creating a context.
+ *
+ * Useful when integrating CloakBrowser with an existing Playwright Browser while
+ * keeping the wrapper's stealth-safe defaults for `newContext()`.
+ */
+/**
+ * Effective headless mode for viewport decisions. buildLaunchOptions() spreads
+ * `...options.launchOptions` LAST, so a raw `launchOptions.headless` overrides the
+ * top-level field at the actual chromium.launch() call. Viewport logic must read
+ * the same effective value — otherwise a headed browser gets a fixed viewport
+ * (reintroducing the impossible-window tell). Playwright-specific (Puppeteer
+ * resolves headless the opposite way).
+ */
+function effectiveHeadless(options: LaunchOptions): boolean {
+  return (
+    (options.launchOptions as { headless?: boolean } | undefined)?.headless ??
+    options.headless ??
+    true
+  );
+}
+
+export function buildContextOptions(
+  options: LaunchContextOptions = {}
+): BrowserContextOptions {
+  // Headed: viewport=null (no emulation) so the page tracks the real window and
+  // outerWidth >= innerWidth stays coherent. Headless on a newer binary: also
+  // null, since it reports coherent dimensions without emulation. Headless on an
+  // older binary: a fixed DEFAULT_VIEWPORT keeps dimensions coherent and
+  // deterministic. Explicit viewport (incl. null) is always honored.
+  const headless = effectiveHeadless(options);
+  const headlessNoViewport =
+    headless && binarySupportsHeadlessNoViewport(
+      options.licenseKey,
+      options.browserVersion,
+      options.releaseChannel,
+    );
+  const viewport =
+    options.viewport !== undefined
+      ? options.viewport
+      : headless && !headlessNoViewport
+        ? DEFAULT_VIEWPORT
+        : null;
+  return {
+    // contextOptions first — explicit wrapper fields below override it.
+    // filterStealthCtxOptions strips locale/timezoneId to prevent CDP detection.
+    ...filterStealthCtxOptions(options.contextOptions),
+    ...(options.userAgent ? { userAgent: options.userAgent } : {}),
+    viewport,
+    ...(options.colorScheme ? { colorScheme: options.colorScheme } : {}),
+  } as BrowserContextOptions;
+}
+
+/**
  * Build Playwright launch options for CloakBrowser without starting Chromium.
  *
  * Useful when integrating CloakBrowser with a custom Playwright build or another
  * wrapper that needs to call `chromium.launch()` itself.
  */
 export async function buildLaunchOptions(
-  options: LaunchOptions = {}
+  options: LaunchOptions = {},
+  statusFile?: string,
 ): Promise<PlaywrightLaunchOptions> {
-  const binaryPath = process.env.CLOAKBROWSER_BINARY_PATH || (await ensureBinary());
+  const binaryPath =
+    process.env.CLOAKBROWSER_BINARY_PATH ||
+    (await ensureBinary(
+      options.licenseKey,
+      options.browserVersion,
+      options.releaseChannel,
+    ));
   const { exitIp, ...resolved } = await maybeResolveGeoip(options);
-  const { proxyOption, proxyArgs } = resolveProxyConfig(options.proxy);
+  const { proxyOption, proxyArgs } = resolveProxyConfig(
+    options.proxy,
+    options.browserVersion,
+    options.licenseKey,
+    options.releaseChannel,
+  );
   let resolvedArgs = await resolveWebrtcArgs(options);
-  if (exitIp && !(resolvedArgs ?? []).some(a => a.startsWith("--fingerprint-webrtc-ip"))) {
-    resolvedArgs = [...(resolvedArgs ?? []), `--fingerprint-webrtc-ip=${exitIp}`];
-  }
+  resolvedArgs = appendWebrtcExitIp(resolvedArgs, exitIp);
   const args = buildArgs({ ...options, ...resolved, args: [...(resolvedArgs ?? []), ...proxyArgs] });
+  maybeWarnWindowsFonts(args);
+
+  // Resolve env for the browser process (license key injection, if needed).
+  const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
+  const launchEnv = buildLaunchEnv(
+    options.licenseKey,
+    userEnv as Record<string, string | undefined> | undefined,
+    statusFile,
+  );
+  const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
   return {
     executablePath: binaryPath,
@@ -68,7 +155,8 @@ export async function buildLaunchOptions(
     args,
     ignoreDefaultArgs: IGNORE_DEFAULT_ARGS,
     ...(proxyOption ? { proxy: proxyOption } : {}),
-    ...options.launchOptions,
+    ...restLaunchOptions,
+    ...envResult,
   } as PlaywrightLaunchOptions;
 }
 
@@ -105,9 +193,55 @@ export async function humanizeBrowser(
  */
 export async function launch(options: LaunchOptions = {}): Promise<Browser> {
   const { chromium } = await import("playwright-core");
-  const browser = await chromium.launch(await buildLaunchOptions(options));
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
+  let browser: Browser;
+  try {
+    browser = await chromium.launch(await buildLaunchOptions(options, denialPath));
+  } catch (err) {
+    const lic = licenseErrorFrom(err);
+    if (lic) throw lic;
+    throw err;
+  }
+  // Convert a post-handshake license denial into a clear error on first use.
+  // Installed before the wraps below so it sits closest to the real call. Stash
+  // the path so launchContext() can guard its context too. Mirrors Python launch().
+  if (denialPath) {
+    (browser as any).__cloakDenialPath = denialPath;
+    installLicenseGuard(browser, denialPath);
+  }
+  // Headed: a bare browser.newPage() would inherit Playwright's emulated 1280x720
+  // viewport -> outerWidth < innerWidth (impossible window = bot tell). Default
+  // newPage()/newContext() to viewport:null so the page tracks the real window.
+  // Headless on a newer binary also qualifies (coherent dimensions natively);
+  // older headless keeps Playwright's default viewport. Mirrors Python launch().
+  if (
+    !effectiveHeadless(options) ||
+    binarySupportsHeadlessNoViewport(
+      options.licenseKey,
+      options.browserVersion,
+      options.releaseChannel,
+    )
+  ) {
+    applyDefaultNoViewport(browser);
+  }
   await humanizeBrowser(browser, options);
   return browser;
+}
+
+/**
+ * Wrap a Browser's newContext()/newPage() to default to viewport:null (no
+ * emulation) when the caller didn't specify a viewport. setdefault-style: an
+ * explicit viewport (including null) is always honored. Apply before humanize's
+ * patchBrowser so the wraps compose.
+ */
+function applyDefaultNoViewport(browser: Browser): void {
+  const origNewContext = browser.newContext.bind(browser);
+  (browser as any).newContext = (options?: Parameters<typeof origNewContext>[0]) =>
+    origNewContext(options?.viewport === undefined ? { ...options, viewport: null } : options);
+
+  const origNewPage = browser.newPage.bind(browser);
+  (browser as any).newPage = (options?: Parameters<typeof origNewPage>[0]) =>
+    origNewPage(options?.viewport === undefined ? { ...options, viewport: null } : options);
 }
 
 /**
@@ -134,24 +268,17 @@ export async function launchContext(
   const { exitIp, ...resolved } = await maybeResolveGeoip(options);
   let launchArgs = await resolveWebrtcArgs(options);
   // Inject geoip exit IP for WebRTC spoofing (free — no extra HTTP call)
-  if (exitIp && !(launchArgs ?? []).some(a => a.startsWith("--fingerprint-webrtc-ip"))) {
-    launchArgs = [...(launchArgs ?? []), `--fingerprint-webrtc-ip=${exitIp}`];
-  }
+  launchArgs = appendWebrtcExitIp(launchArgs, exitIp);
   // --fingerprint-timezone is process-wide (reads CommandLine in renderer),
   // so it applies to ALL contexts, not just the default one.
   // locale and timezone are set via binary flags only — no CDP emulation.
-  const browser = await launch({ ...options, ...resolved, args: launchArgs, geoip: false });
+  // humanize:false on the inner launch — patchContext below applies humanize
+  // exactly once (else launch()'s humanizeBrowser would patch it a second time).
+  const browser = await launch({ ...options, ...resolved, args: launchArgs, geoip: false, humanize: false });
 
   let context: BrowserContext;
   try {
-    context = await browser.newContext({
-      // contextOptions first — explicit wrapper fields below override it.
-      // filterStealthCtxOptions strips locale/timezoneId to prevent CDP detection.
-      ...filterStealthCtxOptions(options.contextOptions),
-      ...(options.userAgent ? { userAgent: options.userAgent } : {}),
-      viewport: options.viewport === undefined ? DEFAULT_VIEWPORT : options.viewport,
-      ...(options.colorScheme ? { colorScheme: options.colorScheme } : {}),
-    });
+    context = await browser.newContext(buildContextOptions(options));
   } catch (err) {
     await browser.close();
     throw err;
@@ -163,6 +290,13 @@ export async function launchContext(
     await origClose();
     await browser.close();
   };
+
+  // browser.newContext above is already guarded by launch(); also guard the
+  // context's newPage for a denial that lands after the context is created.
+  const denialPath = (browser as any).__cloakDenialPath as string | undefined;
+  if (denialPath) {
+    installLicenseGuard(context, denialPath);
+  }
 
   // Human-like behavioral patching
   if (options.humanize) {
@@ -205,31 +339,68 @@ export async function launchPersistentContext(
   options = resolveTimezone(options);
   const { chromium } = await import("playwright-core");
 
-  const binaryPath = process.env.CLOAKBROWSER_BINARY_PATH || (await ensureBinary());
+  const binaryPath =
+    process.env.CLOAKBROWSER_BINARY_PATH ||
+    (await ensureBinary(
+      options.licenseKey,
+      options.browserVersion,
+      options.releaseChannel,
+    ));
   const { exitIp, ...resolved } = await maybeResolveGeoip(options);
-  const { proxyOption, proxyArgs } = resolveProxyConfig(options.proxy);
+  const { proxyOption, proxyArgs } = resolveProxyConfig(
+    options.proxy,
+    options.browserVersion,
+    options.licenseKey,
+    options.releaseChannel,
+  );
   let resolvedArgs = await resolveWebrtcArgs(options);
-  if (exitIp && !(resolvedArgs ?? []).some(a => a.startsWith("--fingerprint-webrtc-ip"))) {
-    resolvedArgs = [...(resolvedArgs ?? []), `--fingerprint-webrtc-ip=${exitIp}`];
-  }
+  resolvedArgs = appendWebrtcExitIp(resolvedArgs, exitIp);
   const args = buildArgs({ ...options, ...resolved, args: [...(resolvedArgs ?? []), ...proxyArgs] });
+  maybeWarnWindowsFonts(args);
+
+  seedWidevineHint(options.userDataDir, binaryPath);
+
+  // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
+  const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
+  const launchEnv = buildLaunchEnv(
+    options.licenseKey,
+    userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
+  );
+  const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
   // locale and timezone are set via binary flags (--lang, --fingerprint-timezone)
   // — NOT via Playwright context kwargs which use detectable CDP emulation.
-  const context = await chromium.launchPersistentContext(options.userDataDir, {
-    executablePath: binaryPath,
-    headless: options.headless ?? true,
-    args,
-    ignoreDefaultArgs: IGNORE_DEFAULT_ARGS,
-    ...(proxyOption ? { proxy: proxyOption } : {}),
-    // contextOptions before explicit wrapper fields so explicit wins.
-    // filterStealthCtxOptions strips locale/timezoneId to prevent CDP detection.
-    ...filterStealthCtxOptions(options.contextOptions),
-    ...(options.userAgent ? { userAgent: options.userAgent } : {}),
-    viewport: options.viewport === undefined ? DEFAULT_VIEWPORT : options.viewport,
-    ...(options.colorScheme ? { colorScheme: options.colorScheme } : {}),
-    ...options.launchOptions,
-  });
+  let context: BrowserContext;
+  try {
+    context = await chromium.launchPersistentContext(options.userDataDir, {
+      executablePath: binaryPath,
+      headless: options.headless ?? true,
+      args,
+      ignoreDefaultArgs: IGNORE_DEFAULT_ARGS,
+      ...(proxyOption ? { proxy: proxyOption } : {}),
+      ...buildContextOptions(options),
+      ...restLaunchOptions,
+      ...envResult,
+    });
+  } catch (err) {
+    const lic = licenseErrorFrom(err);
+    if (lic) throw lic;
+    throw err;
+  }
+
+  // The persistent path hands back a context, so guard its newPage (see launch()).
+  if (denialPath) {
+    installLicenseGuard(context, denialPath);
+    // A persistent context arrives with a page already open, so the user
+    // navigates pages()[0] directly and never calls newPage. Guard the existing
+    // pages' navigation entry points too, or a post-handshake denial surfaces as
+    // a bare TargetClosedError on that first navigation. Mirrors Python.
+    for (const pg of context.pages()) {
+      installLicenseGuard(pg, denialPath);
+    }
+  }
 
   // Human-like behavioral patching
   if (options.humanize) {

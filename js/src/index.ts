@@ -16,7 +16,7 @@
  */
 
 // Launch functions (Playwright API)
-export { launch, launchContext, launchPersistentContext, buildLaunchOptions, humanizeBrowser } from "./playwright.js";
+export { launch, launchContext, launchPersistentContext, buildLaunchOptions, buildContextOptions, humanizeBrowser } from "./playwright.js";
 
 // Binary management
 export { ensureBinary, clearCache, binaryInfo, checkForUpdate } from "./download.js";
@@ -24,5 +24,9 @@ export { ensureBinary, clearCache, binaryInfo, checkForUpdate } from "./download
 // Config
 export { CHROMIUM_VERSION, getDefaultStealthArgs } from "./config.js";
 
+// License
+export { validateLicense, CloakBrowserLicenseError } from "./license.js";
+
 // Types
 export type { LaunchOptions, LaunchContextOptions, LaunchPersistentContextOptions, BinaryInfo } from "./types.js";
+export type { LicenseInfo } from "./license.js";

@@ -6,13 +6,15 @@ Retry loop with backoff matching Playwright internals: [100, 250, 500, 1000]ms.
 
 from __future__ import annotations
 
-import json
-import logging
 import time
-from typing import Any, FrozenSet, Optional, Tuple
+from typing import Any, FrozenSet, Optional
 
-logger = logging.getLogger(__name__)
-
+from .stealth_dom import (
+    build_actionable_js, build_box_js, build_validate_js, eval_parsed,
+    EVALUATION_FAILED, NOT_FOUND, OK, STALE, UNSUPPORTED,
+    StealthEvaluationError, StealthWorldUnavailableError,
+    UnsupportedHumanizeSelectorError,
+)
 
 # ---------------------------------------------------------------------------
 # Error hierarchy — all subclass RuntimeError for backward compat
@@ -61,6 +63,15 @@ class ElementNotReceivingEventsError(ActionabilityError):
         )
 
 
+class ElementTargetChangedError(ActionabilityError):
+    def __init__(self, selector: str):
+        super().__init__(
+            selector,
+            "target_identity",
+            "resolved element changed before pointer dispatch",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Check-set constants
 # ---------------------------------------------------------------------------
@@ -82,6 +93,43 @@ def _backoff_sleep(attempt: int) -> None:
 # ---------------------------------------------------------------------------
 # Pre-scroll actionability: attached, visible, enabled, editable
 # ---------------------------------------------------------------------------
+
+def _stealth_actionable(page: Any, selector: str, checks: FrozenSet[str]) -> None:
+    """Run actionability checks exclusively through the isolated world."""
+    world = getattr(page, "_stealth_world", None)
+    if world is None:
+        raise StealthWorldUnavailableError()
+    status, data = eval_parsed(world, build_actionable_js(selector))
+    if status == UNSUPPORTED:
+        raise UnsupportedHumanizeSelectorError(selector)
+    if status == EVALUATION_FAILED:
+        raise StealthEvaluationError(selector)
+    if status == NOT_FOUND:
+        # Every check-set includes 'attached'; not present yet -> raise so the
+        # retry loop backs off and re-reads in-world (mirrors wait_for(attached)).
+        raise ElementNotAttachedError(selector)
+    if "visible" in checks and not data.get("visible"):
+        raise ElementNotVisibleError(selector)
+    if "enabled" in checks and not data.get("enabled"):
+        raise ElementNotEnabledError(selector)
+    if "editable" in checks and not data.get("editable"):
+        raise ElementNotEditableError(selector)
+
+
+def _read_box(page: Any, selector: str, remaining_ms: float) -> Optional[dict]:
+    """Read geometry exclusively through the isolated world."""
+    world = getattr(page, "_stealth_world", None)
+    if world is None:
+        raise StealthWorldUnavailableError()
+    status, data = eval_parsed(world, build_box_js(selector))
+    if status == OK:
+        return data["box"]
+    if status == NOT_FOUND:
+        return None
+    if status == UNSUPPORTED:
+        raise UnsupportedHumanizeSelectorError(selector)
+    raise StealthEvaluationError(selector)
+
 
 def ensure_actionable(
     page: Any,
@@ -111,29 +159,10 @@ def ensure_actionable(
             raise ActionabilityError(selector, "timeout", "timeout expired before first check")
 
         try:
-            loc = page.locator(selector).first
-
-            if "attached" in checks:
-                try:
-                    loc.wait_for(state="attached", timeout=max(1, min(remaining_ms, 2000)))
-                except Exception:
-                    raise ElementNotAttachedError(selector)
-
-            if "visible" in checks:
-                if not loc.is_visible():
-                    raise ElementNotVisibleError(selector)
-
-            if "enabled" in checks:
-                if not loc.is_enabled():
-                    raise ElementNotEnabledError(selector)
-
-            if "editable" in checks:
-                if not loc.is_editable():
-                    raise ElementNotEditableError(selector)
-
+            _stealth_actionable(page, selector, checks)
             return
 
-        except ActionabilityError as e:
+        except (ActionabilityError, StealthEvaluationError) as e:
             last_error = e
             if time.monotonic() >= deadline:
                 raise last_error
@@ -171,16 +200,22 @@ def ensure_stable(
         if remaining_ms <= 0:
             raise ElementNotStableError(selector)
 
-        loc = page.locator(selector).first
-        box1 = loc.bounding_box(timeout=max(1, min(remaining_ms, 1000)))
-        if box1 is None:
-            raise ElementNotAttachedError(selector)
+        try:
+            box1 = _read_box(page, selector, remaining_ms)
+            if box1 is None:
+                raise ElementNotAttachedError(selector)
 
-        time.sleep(0.1)
+            time.sleep(0.1)
 
-        box2 = loc.bounding_box(timeout=max(1, min(remaining_ms, 1000)))
-        if box2 is None:
-            raise ElementNotAttachedError(selector)
+            box2 = _read_box(page, selector, remaining_ms)
+            if box2 is None:
+                raise ElementNotAttachedError(selector)
+        except StealthEvaluationError:
+            if time.monotonic() >= deadline:
+                raise
+            _backoff_sleep(attempt)
+            attempt += 1
+            continue
 
         if not _boxes_differ(box1, box2):
             return
@@ -196,17 +231,12 @@ def ensure_stable(
 # Pointer-events check (post-scroll, at actual click coordinates)
 # ---------------------------------------------------------------------------
 
-_POINTER_EVENTS_LOCATOR_JS = """(expected, coords) => {
-    const target = document.elementFromPoint(coords.x, coords.y);
-    if (!target) return { hit: false, reason: 'no_element_at_point', covering: 'none' };
-    let node = target;
-    while (node) { if (node === expected) return { hit: true }; node = node.parentNode; }
-    if (expected.contains(target)) return { hit: true };
-    return { hit: false, reason: 'covered', covering: target.tagName || 'unknown' };
-}"""
-
-_POINTER_EVENTS_HANDLE_JS = """(expected, coords) => {
-    const target = document.elementFromPoint(coords.x, coords.y);
+# Legacy ElementHandle paths cannot use selector-based isolated-world identity.
+_POINTER_EVENTS_HANDLE_JS = """(expected, data) => {
+    const rect = expected.getBoundingClientRect();
+    const frameOffsetX = data.box ? data.box.x - rect.x : 0;
+    const frameOffsetY = data.box ? data.box.y - rect.y : 0;
+    const target = document.elementFromPoint(data.x - frameOffsetX, data.y - frameOffsetY);
     if (!target) return { hit: false, reason: 'no_element_at_point', covering: 'none' };
     let node = target;
     while (node) { if (node === expected) return { hit: true }; node = node.parentNode; }
@@ -218,35 +248,46 @@ _POINTER_EVENTS_HANDLE_JS = """(expected, coords) => {
 def check_pointer_events(
     page: Any,
     selector: str,
+    target_id: int,
+    gen: int,
     x: float,
     y: float,
     stealth: Any = None,
     timeout: float = 5000,
 ) -> None:
-    """Check that elementFromPoint(x, y) hits the expected element.
+    """Revalidate that the click point still hits the same resolved element.
 
-    Uses locator.evaluate() so all Playwright selector types work
-    (text=, role=, XPath, CSS, etc.). Retries with backoff for transient overlays.
+    Callers skip this entirely when ``force=True`` (matching Playwright, where
+    ``force`` bypasses all actionability checks).
     """
     deadline = time.monotonic() + timeout / 1000.0
     attempt = 0
-    coords = {"x": x, "y": y}
+    last_miss: Optional[str] = None
+    world = stealth if stealth is not None else getattr(page, "_stealth_world", None)
+    if world is None:
+        raise StealthWorldUnavailableError()
+    if not isinstance(target_id, int) or not isinstance(gen, int):
+        raise StealthEvaluationError(selector)
 
     while True:
-        try:
-            loc = page.locator(selector).first
-            result = loc.evaluate(_POINTER_EVENTS_LOCATOR_JS, coords)
-        except Exception as exc:
-            logger.debug("pointer_events check failed for %r: %s", selector, exc)
-            result = None
-
-        if result and result.get("hit", False):
+        status, data = eval_parsed(
+            world, build_validate_js(selector, target_id, gen, x, y)
+        )
+        if status == UNSUPPORTED:
+            raise UnsupportedHumanizeSelectorError(selector)
+        if status == STALE:
+            raise ElementTargetChangedError(selector)
+        if status == NOT_FOUND:
+            raise ElementNotAttachedError(selector)
+        if status == EVALUATION_FAILED:
+            if time.monotonic() >= deadline:
+                raise StealthEvaluationError(selector)
+        elif data.get("hit", False):
             return
-
-        covering = (result or {}).get("covering", "unknown")
-
-        if time.monotonic() >= deadline:
-            raise ElementNotReceivingEventsError(selector, covering)
+        else:
+            last_miss = data.get("covering", "unknown")
+            if time.monotonic() >= deadline:
+                raise ElementNotReceivingEventsError(selector, last_miss)
 
         _backoff_sleep(attempt)
         attempt += 1
@@ -322,15 +363,16 @@ def check_pointer_events_handle(
     deadline = time.monotonic() + timeout / 1000.0
     attempt = 0
 
-    coords = {"x": x, "y": y}
-
     while True:
         try:
-            result = el.evaluate(_POINTER_EVENTS_HANDLE_JS, coords)
+            box = el.bounding_box()
+            result = el.evaluate(_POINTER_EVENTS_HANDLE_JS, {"x": x, "y": y, "box": box})
         except Exception:
             result = None
 
-        if result and result.get("hit", False):
+        # Proceed if the check confirms a hit, or if it could not be determined
+        # (None) — failing closed would block legitimate clicks.
+        if result is None or result.get("hit", False):
             return
 
         covering = (result or {}).get("covering", "unknown")

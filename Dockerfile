@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf-2.0-0 libxss1 libxtst6 fonts-liberation \
     fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
     fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf \
-    xvfb xdotool \
+    fonts-urw-base35 \
+    xvfb xdotool openbox \
     curl ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -39,7 +40,8 @@ RUN python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
 # CLI shortcuts
 COPY bin/cloaktest /usr/local/bin/cloaktest
 COPY bin/cloakserve /usr/local/bin/cloakserve
-RUN chmod +x /usr/local/bin/cloaktest /usr/local/bin/cloakserve
+COPY bin/fetch-widevine.py /usr/local/bin/fetch-widevine.py
+RUN chmod +x /usr/local/bin/cloaktest /usr/local/bin/cloakserve /usr/local/bin/fetch-widevine.py
 
 EXPOSE 9222
 
